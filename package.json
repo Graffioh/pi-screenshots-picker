@@ -1,0 +1,32 @@
+{
+  "name": "pi-screenshots-picker",
+  "version": "1.0.0",
+  "description": "Screenshot picker extension for pi coding agent - quickly select and attach screenshots to your prompts",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "screenshots",
+    "macos",
+    "linux",
+    "image",
+    "attachment",
+    "picker",
+    "tui",
+    "claude",
+    "gemini",
+    "codex"
+  ],
+  "author": "Graffioh",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Graffioh/pi-screenshots-picker"
+  },
+  "homepage": "https://github.com/Graffioh/pi-screenshots-picker#readme",
+  "bugs": {
+    "url": "https://github.com/Graffioh/pi-screenshots-picker/issues"
+  }
+}
