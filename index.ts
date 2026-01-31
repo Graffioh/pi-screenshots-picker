@@ -22,6 +22,7 @@
  *   ↑↓               - Navigate
  *   s / space        - Stage current screenshot (can repeat on different items)
  *   o                - Open in default viewer
+ *   d                - Delete screenshot from disk
  *   enter            - Close selector
  *   esc              - Cancel
  *
@@ -44,7 +45,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ImageContent } from "@mariozechner/pi-coding-agent";
@@ -286,7 +287,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 	 */
 	async function showScreenshotSelector(ctx: ExtensionContext): Promise<void> {
 		const directory = getScreenshotDir();
-		const screenshots = getScreenshots(directory);
+		let screenshots = getScreenshots(directory);
 
 		if (screenshots.length === 0) {
 			ctx.ui.notify(`No screenshots found in ${directory}`, "warning");
@@ -482,8 +483,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					// Footer (3 lines)
 					const stagedCount = alreadyStaged.size;
 					const hint = stagedCount > 0
-						? `${stagedCount} staged • s/space stage more • enter done • esc cancel`
-						: "↑↓ navigate • s/space stage • o open • enter done";
+						? `${stagedCount} staged • s/space stage more • d delete • enter done`
+						: "↑↓ navigate • s/space stage • o open • d delete • enter done";
 					lines.push(padToWidth("", LIST_WIDTH) + "│");
 					lines.push(padToWidth(" " + theme.fg("dim", hint), LIST_WIDTH) + "│");
 					lines.push(border);
@@ -518,6 +519,80 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					} else if (data === "o") {
 						// Open in default image viewer
 						openFile(screenshots[cursor].path);
+					} else if (data === "d" || data === "D") {
+						// Delete the screenshot file from disk
+						if (screenshots.length === 0) return;
+						
+						const screenshot = screenshots[cursor];
+						try {
+							unlinkSync(screenshot.path);
+							
+							// Remove from thumbnails cache if present
+							thumbnails.delete(cursor);
+							
+							// Remove from alreadyStaged if it was staged
+							if (alreadyStaged.has(cursor)) {
+								// Find and remove the corresponding staged image
+								const imgIndex = [...alreadyStaged].filter(i => i < cursor).length;
+								if (imgIndex < stagedImages.length) {
+									stagedImages.splice(imgIndex, 1);
+								}
+								alreadyStaged.delete(cursor);
+							}
+							
+							// Update alreadyStaged indices (decrement indices > cursor)
+							const newStaged = new Set<number>();
+							for (const idx of alreadyStaged) {
+								if (idx > cursor) {
+									newStaged.add(idx - 1);
+								} else {
+									newStaged.add(idx);
+								}
+							}
+							alreadyStaged.clear();
+							for (const idx of newStaged) {
+								alreadyStaged.add(idx);
+							}
+							
+							// Rebuild thumbnails map with updated indices
+							const newThumbnails = new Map<number, { data: string; mimeType: string } | null>();
+							for (const [idx, thumb] of thumbnails) {
+								if (idx > cursor) {
+									newThumbnails.set(idx - 1, thumb);
+								} else if (idx < cursor) {
+									newThumbnails.set(idx, thumb);
+								}
+								// Skip idx === cursor (deleted)
+							}
+							thumbnails.clear();
+							for (const [idx, thumb] of newThumbnails) {
+								thumbnails.set(idx, thumb);
+							}
+							
+							// Remove from screenshots array
+							screenshots.splice(cursor, 1);
+							
+							// Adjust cursor if needed
+							if (screenshots.length === 0) {
+								done(null); // No more screenshots, close
+								return;
+							}
+							if (cursor >= screenshots.length) {
+								cursor = screenshots.length - 1;
+							}
+							
+							// Adjust scroll offset if needed
+							if (scrollOffset > 0 && scrollOffset >= screenshots.length - VISIBLE_ITEMS + 1) {
+								scrollOffset = Math.max(0, screenshots.length - VISIBLE_ITEMS);
+							}
+							
+							// Reset lastRenderedIndex to force re-render
+							lastRenderedIndex = -1;
+							
+							tui.requestRender();
+						} catch {
+							// Silently fail if deletion fails
+						}
 					}
 				},
 			};
