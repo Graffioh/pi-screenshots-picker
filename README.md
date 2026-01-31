@@ -2,6 +2,12 @@
 
 A [pi coding agent](https://github.com/badlogic/pi-mono/) extension for quickly selecting and attaching screenshots to your prompts. Works on **macOS** and **Linux**. Browse recent screenshots with thumbnail previews, stage multiple images, then type your message - screenshots attach automatically when you send.
 
+
+
+https://github.com/user-attachments/assets/365f6fa8-0922-4172-8611-141300aed7f6
+
+
+
 ## Why
 
 Attaching screenshots during development is tedious. You're constantly:
