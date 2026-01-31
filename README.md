@@ -43,8 +43,10 @@ Opens the interactive screenshot picker UI. Browse your recent screenshots with 
 
 **Keys:**
 - **↑↓** - Navigate through screenshots
+- **Ctrl+T** - Cycle through source tabs (when multiple sources configured)
 - **s / space** - Stage current screenshot (✓ indicator appears)
 - **o** - Open in Preview.app
+- **d** - Delete screenshot from disk
 - **Enter** - Close picker
 - **Esc** - Cancel
 
@@ -58,18 +60,56 @@ Keyboard shortcut to open the picker (same as `/ss`).
 
 ## Features
 
+- **Multiple sources with tabs** - Configure multiple directories/patterns, switch with Ctrl+T
+- **Glob pattern support** - Use patterns like `**/*.png` to match files flexibly
 - **Thumbnail previews** - See what you're selecting (Kitty/iTerm2/Ghostty/WezTerm)
 - **Multi-select** - Stage multiple screenshots, they all attach when you send
 - **Relative timestamps** - "2 minutes ago", "yesterday", etc.
 - **File sizes** - Know what you're attaching
+- **Delete screenshots** - Press `d` to remove unwanted screenshots from disk
 - **Staged indicator** - Widget shows `📷 N screenshots staged` below the editor
-- **Auto-detection** - Finds your screenshot folder automatically
+- **Auto-detection** - Finds your screenshot folder automatically when no config
 
 ## Configuration
 
 By default, the extension auto-detects your screenshot location based on your platform.
 
-### Default Locations
+### Multiple Sources with Tabs
+
+Configure multiple screenshot sources in `~/.pi/agent/settings.json`. Each source becomes a tab in the picker UI - use **Ctrl+T** to cycle through them:
+
+```json
+{
+  "pi-screenshots": {
+    "sources": [
+      "~/Desktop/ss",
+      "~/Pictures/Screenshots",
+      "/path/to/comfyui/output/**/thumbnail_*.png"
+    ]
+  }
+}
+```
+
+### Source Types
+
+**Plain directories** - Scans for screenshot-named PNG files:
+```json
+"~/Desktop/ss"
+```
+
+**Glob patterns** - Matches any image file (PNG, JPG, WebP) matching the pattern:
+```json
+"/path/to/images/**/*.png"
+"/mnt/Store/ComfyUI/Output/**/thumbnail_*.png"
+```
+
+Glob patterns support:
+- `*` - Match any characters in a filename
+- `**` - Match any directories recursively
+- `?` - Match a single character
+- `[abc]` - Match any character in brackets
+
+### Default Locations (when no config)
 
 **macOS:**
 1. System preferences (`defaults read com.apple.screencapture location`)
@@ -81,17 +121,9 @@ By default, the extension auto-detects your screenshot location based on your pl
 3. `~/Screenshots`
 4. `~/Desktop`
 
-### Custom Directory
+### Environment Variable
 
-Create `~/.pi/agent/extensions/screenshots.json`:
-
-```json
-{
-  "directory": "/path/to/your/screenshots"
-}
-```
-
-Or set the environment variable:
+You can also use the `PI_SCREENSHOTS_DIR` environment variable as a fallback:
 
 ```bash
 export PI_SCREENSHOTS_DIR="/path/to/screenshots"
@@ -99,7 +131,7 @@ export PI_SCREENSHOTS_DIR="/path/to/screenshots"
 
 ### Priority
 
-1. Config file (`~/.pi/agent/extensions/screenshots.json`)
+1. Config in `~/.pi/agent/settings.json` (`pi-screenshots.sources`)
 2. Environment variable (`PI_SCREENSHOTS_DIR`)
 3. Platform default (see above)
 

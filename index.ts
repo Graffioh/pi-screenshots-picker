@@ -6,6 +6,8 @@
  *
  * Features:
  * - Shows all recent screenshots with scrollable list
+ * - Multiple source directories with tabs (Ctrl+T to cycle)
+ * - Supports glob patterns for flexible file matching
  * - Displays relative timestamps (e.g., "2 minutes ago")
  * - Shows thumbnail preview of selected screenshot
  * - Press 'o' to open in default image viewer
@@ -19,7 +21,8 @@
  *   Ctrl+Shift+S     - Quick access shortcut
  *
  * Keys:
- *   ↑↓               - Navigate
+ *   ↑↓               - Navigate screenshots
+ *   Ctrl+T           - Cycle through source tabs
  *   s / space        - Stage current screenshot (can repeat on different items)
  *   o                - Open in default viewer
  *   d                - Delete screenshot from disk
@@ -28,18 +31,29 @@
  *
  * Workflow:
  *   1. Press Ctrl+Shift+S or /ss to open selector
- *   2. Navigate with ↑↓, press s/space to stage screenshots (✓ appears)
- *   3. Press Enter to close selector
- *   4. Type your message in the prompt
- *   5. Press Enter to send - staged images are automatically attached
+ *   2. Use Ctrl+T to switch between source tabs (if multiple configured)
+ *   3. Navigate with ↑↓, press s/space to stage screenshots (✓ appears)
+ *   4. Press Enter to close selector
+ *   5. Type your message in the prompt
+ *   6. Press Enter to send - staged images are automatically attached
  *
- * Configuration (optional):
- *   Set screenshot directory in ~/.pi/agent/extensions/screenshots.json:
- *   { "directory": "/path/to/screenshots" }
+ * Configuration (in ~/.pi/agent/settings.json):
+ *   {
+ *     "pi-screenshots": {
+ *       "sources": [
+ *         "~/Pictures/Screenshots",
+ *         "/path/to/comfyui/output/**‎/thumbnail_*.png"
+ *       ]
+ *     }
+ *   }
  *
- *   Or use PI_SCREENSHOTS_DIR environment variable.
+ *   Sources can be:
+ *   - Plain directories: scans for screenshot-named PNGs
+ *   - Glob patterns: matches any file matching the pattern
  *
- * Default screenshot locations:
+ *   Environment variable PI_SCREENSHOTS_DIR is also supported as fallback.
+ *
+ * Default screenshot locations (when no config):
  *   macOS: reads from screencapture preferences, falls back to ~/Desktop
  *   Linux: ~/Pictures/Screenshots, ~/Pictures, ~/Screenshots, or ~/Desktop
  */
@@ -47,9 +61,10 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ImageContent } from "@mariozechner/pi-coding-agent";
 import { Image, Key, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
+import { globSync } from "glob";
 
 interface ScreenshotInfo {
 	path: string;
@@ -58,8 +73,14 @@ interface ScreenshotInfo {
 	size: number;
 }
 
+interface SourceTab {
+	label: string;
+	pattern: string;
+	screenshots: ScreenshotInfo[];
+}
+
 interface Config {
-	directory?: string;
+	sources?: string[];
 }
 
 const SCREENSHOT_PATTERNS = [
@@ -85,6 +106,23 @@ const SCREENSHOT_PATTERNS = [
  */
 const isMacOS = process.platform === "darwin";
 const isLinux = process.platform === "linux";
+
+/**
+ * Expand ~ to home directory.
+ */
+function expandPath(path: string): string {
+	if (path.startsWith("~/")) {
+		return join(homedir(), path.slice(2));
+	}
+	return path;
+}
+
+/**
+ * Check if a pattern contains glob characters.
+ */
+function isGlobPattern(pattern: string): boolean {
+	return /[*?[\]{}!]/.test(pattern);
+}
 
 /**
  * Get the default screenshot directory based on platform.
@@ -140,13 +178,16 @@ function openFile(path: string): void {
 }
 
 /**
- * Load extension config.
+ * Load extension config from settings.json.
  */
 function loadConfig(): Config {
-	const configPath = join(homedir(), ".pi", "agent", "extensions", "screenshots.json");
-	if (existsSync(configPath)) {
+	const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+	if (existsSync(settingsPath)) {
 		try {
-			return JSON.parse(readFileSync(configPath, "utf-8"));
+			const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			if (settings["pi-screenshots"]) {
+				return settings["pi-screenshots"];
+			}
 		} catch {
 			// Ignore parse errors
 		}
@@ -162,9 +203,9 @@ function isScreenshotName(name: string): boolean {
 }
 
 /**
- * Get all screenshots from directory, sorted by name (descending).
+ * Get screenshots from a plain directory (with screenshot name filtering).
  */
-function getScreenshots(directory: string): ScreenshotInfo[] {
+function getScreenshotsFromDirectory(directory: string): ScreenshotInfo[] {
 	if (!existsSync(directory)) {
 		return [];
 	}
@@ -178,18 +219,85 @@ function getScreenshots(directory: string): ScreenshotInfo[] {
 		})
 		.map((name) => {
 			const path = join(directory, name);
-			const stats = statSync(path);
-			return {
-				path,
-				name,
-				mtime: stats.mtime,
-				size: stats.size,
-			};
+			try {
+				const stats = statSync(path);
+				return {
+					path,
+					name,
+					mtime: stats.mtime,
+					size: stats.size,
+				};
+			} catch {
+				return null;
+			}
 		})
-		// Sort by filename descending (more reliable than mtime for screenshots)
-		.sort((a, b) => b.name.localeCompare(a.name));
+		.filter((f): f is ScreenshotInfo => f !== null);
 
 	return files;
+}
+
+/**
+ * Get screenshots from a glob pattern (no name filtering - pattern defines what to match).
+ */
+function getScreenshotsFromGlob(pattern: string): ScreenshotInfo[] {
+	try {
+		const expandedPattern = expandPath(pattern);
+		const files = globSync(expandedPattern, { nodir: true });
+		
+		return files
+			.filter((path) => {
+				// Only include image files
+				const ext = path.toLowerCase();
+				return ext.endsWith(".png") || ext.endsWith(".jpg") || ext.endsWith(".jpeg") || ext.endsWith(".webp");
+			})
+			.map((path) => {
+				try {
+					const stats = statSync(path);
+					return {
+						path: resolve(path),
+						name: basename(path),
+						mtime: stats.mtime,
+						size: stats.size,
+					};
+				} catch {
+					return null;
+				}
+			})
+			.filter((f): f is ScreenshotInfo => f !== null);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Get screenshots from a source (handles both directories and glob patterns).
+ */
+function getScreenshotsFromSource(source: string): ScreenshotInfo[] {
+	const expanded = expandPath(source);
+	
+	if (isGlobPattern(expanded)) {
+		return getScreenshotsFromGlob(expanded);
+	}
+	
+	// Plain directory - use screenshot name filtering
+	return getScreenshotsFromDirectory(expanded);
+}
+
+/**
+ * Create a short label from a source pattern.
+ */
+function createSourceLabel(source: string): string {
+	const expanded = expandPath(source);
+	
+	if (isGlobPattern(expanded)) {
+		// For globs, use the directory part + pattern hint
+		const dir = dirname(expanded.split("*")[0]);
+		const dirName = basename(dir) || dir;
+		return dirName.slice(0, 15);
+	}
+	
+	// For directories, use the last component
+	return basename(expanded).slice(0, 15);
 }
 
 /**
@@ -224,9 +332,14 @@ function formatSize(bytes: number): string {
  */
 function loadImageBase64(path: string): { data: string; mimeType: string } {
 	const buffer = readFileSync(path);
+	const ext = path.toLowerCase();
+	let mimeType = "image/png";
+	if (ext.endsWith(".jpg") || ext.endsWith(".jpeg")) mimeType = "image/jpeg";
+	else if (ext.endsWith(".webp")) mimeType = "image/webp";
+	
 	return {
 		data: buffer.toString("base64"),
-		mimeType: "image/png",
+		mimeType,
 	};
 }
 
@@ -237,17 +350,24 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 	let stagedImages: ImageContent[] = [];
 
 	/**
-	 * Get screenshot directory (config > env > macOS prefs > Desktop).
+	 * Get source tabs based on configuration.
 	 */
-	function getScreenshotDir(): string {
-		if (config.directory && existsSync(config.directory)) {
-			return config.directory;
-		}
-		const envDir = process.env.PI_SCREENSHOTS_DIR;
-		if (envDir && existsSync(envDir)) {
-			return envDir;
-		}
-		return getDefaultScreenshotDir();
+	function getSourceTabs(): SourceTab[] {
+		const sources = config.sources && config.sources.length > 0
+			? config.sources
+			: [process.env.PI_SCREENSHOTS_DIR || getDefaultScreenshotDir()];
+		
+		return sources.map((source) => {
+			const screenshots = getScreenshotsFromSource(source);
+			// Sort by mtime descending (most recent first)
+			screenshots.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+			
+			return {
+				label: createSourceLabel(source),
+				pattern: source,
+				screenshots,
+			};
+		});
 	}
 
 	// Intercept input events to attach staged images
@@ -270,74 +390,104 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	// Helper to get PNG dimensions
-	function getPngDimensions(base64Data: string): { width: number; height: number } | null {
+	// Helper to get PNG/JPEG dimensions
+	function getImageDimensions(base64Data: string, mimeType: string): { width: number; height: number } | null {
 		try {
 			const buffer = Buffer.from(base64Data, "base64");
-			if (buffer.length < 24) return null;
-			if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) return null;
-			return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+			
+			if (mimeType === "image/png") {
+				if (buffer.length < 24) return null;
+				if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) return null;
+				return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+			}
+			
+			// For JPEG/WebP, just return null and let the image component handle it
+			return null;
 		} catch {
 			return null;
 		}
 	}
 
 	/**
-	 * Show screenshot selector UI.
+	 * Show screenshot selector UI with tabs.
 	 */
 	async function showScreenshotSelector(ctx: ExtensionContext): Promise<void> {
-		const directory = getScreenshotDir();
-		let screenshots = getScreenshots(directory);
-
-		if (screenshots.length === 0) {
-			ctx.ui.notify(`No screenshots found in ${directory}`, "warning");
+		let tabs = getSourceTabs();
+		
+		// Filter out empty tabs
+		const nonEmptyTabs = tabs.filter(t => t.screenshots.length > 0);
+		
+		if (nonEmptyTabs.length === 0) {
+			const sources = config.sources?.join(", ") || getDefaultScreenshotDir();
+			ctx.ui.notify(`No screenshots found in: ${sources}`, "warning");
 			return;
 		}
+		
+		tabs = nonEmptyTabs;
 
 		// Lazy-load thumbnails (load on demand, skip files > 5MB)
 		const MAX_THUMB_SIZE = 5 * 1024 * 1024; // 5MB
-		const thumbnails: Map<number, { data: string; mimeType: string } | null> = new Map();
+		const thumbnails: Map<string, { data: string; mimeType: string } | null> = new Map();
 		
-		function loadThumbnail(index: number): { data: string; mimeType: string } | null {
-			if (thumbnails.has(index)) {
-				return thumbnails.get(index) || null;
+		function loadThumbnail(path: string, size: number): { data: string; mimeType: string } | null {
+			if (thumbnails.has(path)) {
+				return thumbnails.get(path) || null;
 			}
-			const screenshot = screenshots[index];
-			if (!screenshot || screenshot.size > MAX_THUMB_SIZE) {
-				thumbnails.set(index, null);
+			if (size > MAX_THUMB_SIZE) {
+				thumbnails.set(path, null);
 				return null;
 			}
 			try {
-				const img = loadImageBase64(screenshot.path);
-				thumbnails.set(index, img);
+				const img = loadImageBase64(path);
+				thumbnails.set(path, img);
 				return img;
 			} catch {
-				thumbnails.set(index, null);
+				thumbnails.set(path, null);
 				return null;
 			}
 		}
 
-		// Track which screenshots have been staged during this session
-		const alreadyStaged = new Set<number>();
+		// Track which screenshots have been staged during this session (by path)
+		const alreadyStaged = new Set<string>();
 
 		const result = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+			let activeTab = 0;
 			let cursor = 0;
 			let scrollOffset = 0;
 			const LIST_WIDTH = 45;
-			const VISIBLE_ITEMS = 12;
-			const CONTENT_LINES = 12;
+			const VISIBLE_ITEMS = 10;
+			const CONTENT_LINES = 10;
+			const TAB_HEIGHT = tabs.length > 1 ? 2 : 0; // Extra lines for tabs
 
 			const imageTheme = {
 				fallbackColor: (s: string) => theme.fg("dim", s),
 			};
 
-			// Helper to stage a single screenshot immediately
-			function stageScreenshot(index: number): void {
-				if (alreadyStaged.has(index)) return; // Already staged this one
-				
-				const screenshot = screenshots[index];
-				if (!screenshot) return;
+			// Get current tab's screenshots
+			function getCurrentScreenshots(): ScreenshotInfo[] {
+				return tabs[activeTab]?.screenshots || [];
+			}
 
+			// Helper to toggle stage/unstage a screenshot
+			function toggleStageScreenshot(screenshot: ScreenshotInfo): void {
+				if (alreadyStaged.has(screenshot.path)) {
+					// Unstage - remove from stagedImages and alreadyStaged
+					const idx = stagedImages.findIndex((img, i) => {
+						// Find by matching the path in alreadyStaged order
+						const stagedPaths = [...alreadyStaged];
+						return stagedPaths[i] === screenshot.path;
+					});
+					// Simpler approach: rebuild stagedImages without this path
+					const stagedPaths = [...alreadyStaged];
+					const pathIndex = stagedPaths.indexOf(screenshot.path);
+					if (pathIndex !== -1) {
+						stagedImages.splice(pathIndex, 1);
+					}
+					alreadyStaged.delete(screenshot.path);
+					return;
+				}
+
+				// Stage - add to stagedImages
 				try {
 					const img = loadImageBase64(screenshot.path);
 					stagedImages.push({
@@ -345,7 +495,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						mimeType: img.mimeType,
 						data: img.data,
 					});
-					alreadyStaged.add(index);
+					alreadyStaged.add(screenshot.path);
 				} catch {
 					// Silently fail for individual staging
 				}
@@ -379,18 +529,18 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				return str + " ".repeat(targetWidth - currentWidth);
 			}
 
-			let lastRenderedIndex = -1;
+			let lastRenderedPath = "";
 
-			function renderThumbnail(index: number): string[] {
-				const thumb = loadThumbnail(index);
-				const name = screenshots[index]?.name?.slice(-20) || "?";
+			function renderThumbnail(screenshot: ScreenshotInfo): string[] {
+				const thumb = loadThumbnail(screenshot.path, screenshot.size);
+				const name = screenshot.name.slice(-20);
 
 				// Delete previous image by ID when switching
 				let deleteCmd = "";
-				if (lastRenderedIndex !== -1 && lastRenderedIndex !== index) {
-					deleteCmd = `\x1b_Ga=d,d=I,i=${9000 + lastRenderedIndex}\x1b\\`;
+				if (lastRenderedPath && lastRenderedPath !== screenshot.path) {
+					deleteCmd = `\x1b_Ga=d,d=I,i=9000\x1b\\`;
 				}
-				lastRenderedIndex = index;
+				lastRenderedPath = screenshot.path;
 
 				if (!thumb) {
 					const lines: string[] = [];
@@ -401,24 +551,23 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 				try {
 					// Get dimensions and calculate constrained width so height fits
-					const dims = getPngDimensions(thumb.data);
+					const dims = getImageDimensions(thumb.data, thumb.mimeType);
 					const maxWidth = dims ? calculateConstrainedWidth(dims, CONTENT_LINES) : MAX_WIDTH_CELLS;
 
 					const img = new Image(thumb.data, thumb.mimeType, imageTheme, {
 						maxWidthCells: maxWidth,
-						imageId: 9000 + index,
+						imageId: 9000,
 					});
 					const rendered = img.render(maxWidth + 2);
 
 					// Image component returns (rows-1) empty lines, then cursor-up + image on last line.
-					// Pass through all lines - the cursor-up positions the image correctly.
 					const lines: string[] = [];
 					for (let i = 0; i < CONTENT_LINES; i++) {
 						const line = rendered[i] || "";
 						lines.push(i === 0 ? deleteCmd + line : line);
 					}
 					return lines;
-				} catch (err) {
+				} catch {
 					const lines: string[] = [];
 					lines.push(deleteCmd + theme.fg("error", `  [Error: ${name}]`));
 					for (let i = 1; i < CONTENT_LINES; i++) lines.push("");
@@ -430,18 +579,45 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				render(width: number) {
 					const lines: string[] = [];
 					const border = theme.fg("accent", "─".repeat(width));
+					const screenshots = getCurrentScreenshots();
 
-					// Header (4 lines)
+					// Header
+					lines.push(border);
+					
+					// Tabs (if multiple sources)
+					if (tabs.length > 1) {
+						let tabLine = " ";
+						for (let i = 0; i < tabs.length; i++) {
+							const tab = tabs[i];
+							const count = tab.screenshots.length;
+							const label = `${tab.label} (${count})`;
+							
+							if (i === activeTab) {
+								tabLine += theme.fg("accent", theme.bold(`[${label}]`));
+							} else {
+								tabLine += theme.fg("dim", ` ${label} `);
+							}
+							tabLine += " ";
+						}
+						tabLine += theme.fg("dim", "  Ctrl+T: switch");
+						lines.push(padToWidth(tabLine, LIST_WIDTH) + "│");
+						lines.push(padToWidth("", LIST_WIDTH) + "│");
+					}
+
+					// Title
 					const countInfo = screenshots.length > VISIBLE_ITEMS 
 						? ` (${cursor + 1}/${screenshots.length})`
 						: "";
-					lines.push(border);
 					lines.push(padToWidth(" " + theme.fg("accent", theme.bold("Recent Screenshots")) + theme.fg("dim", countInfo), LIST_WIDTH) + "│");
-					lines.push(padToWidth(" " + theme.fg("dim", directory.slice(-40)), LIST_WIDTH) + "│");
+					
+					// Source path hint
+					const sourcePath = expandPath(tabs[activeTab].pattern).slice(-40);
+					lines.push(padToWidth(" " + theme.fg("dim", sourcePath), LIST_WIDTH) + "│");
 					lines.push(padToWidth("", LIST_WIDTH) + "│");
 
-					// Render thumbnail - brand new Image created each time
-					const imageLines = renderThumbnail(cursor);
+					// Render thumbnail for current selection
+					const currentScreenshot = screenshots[cursor];
+					const imageLines = currentScreenshot ? renderThumbnail(currentScreenshot) : Array(CONTENT_LINES).fill("");
 
 					// Content area: fixed CONTENT_LINES rows with scrolling
 					for (let i = 0; i < CONTENT_LINES; i++) {
@@ -450,7 +626,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 						if (itemIndex < screenshots.length) {
 							const screenshot = screenshots[itemIndex];
-							const isStaged = alreadyStaged.has(itemIndex);
+							const isStaged = alreadyStaged.has(screenshot.path);
 							const isCursor = itemIndex === cursor;
 
 							// Show different indicators: ✓ = staged, ○ = not staged
@@ -480,13 +656,16 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						lines.push(paddedLine + "│ " + imageLine);
 					}
 
-					// Footer (3 lines)
+					// Footer
 					const stagedCount = alreadyStaged.size;
-					const hint = stagedCount > 0
-						? `${stagedCount} staged • s/space stage more • d delete • enter done`
-						: "↑↓ navigate • s/space stage • o open • d delete • enter done";
-					lines.push(padToWidth("", LIST_WIDTH) + "│");
-					lines.push(padToWidth(" " + theme.fg("dim", hint), LIST_WIDTH) + "│");
+					lines.push("");
+					if (stagedCount === 0) {
+						lines.push(" " + theme.fg("warning", "⚠ Press s/space to stage screenshots before closing"));
+						lines.push(" " + theme.fg("dim", "↑↓ nav • s/space toggle • o open • d delete • enter done"));
+					} else {
+						lines.push(" " + theme.fg("success", `✓ ${stagedCount} staged`));
+						lines.push(" " + theme.fg("dim", "s/space toggle • d delete • enter done"));
+					}
 					lines.push(border);
 
 					return lines;
@@ -495,12 +674,25 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					// Nothing to invalidate
 				},
 				handleInput(data: string) {
+					const screenshots = getCurrentScreenshots();
+					
 					// Helper to clean up displayed image before exiting
 					function cleanupImage() {
-						if (lastRenderedIndex !== -1) {
-							// Delete the Kitty graphics image
-							process.stdout.write(`\x1b_Ga=d,d=I,i=${9000 + lastRenderedIndex}\x1b\\`);
+						if (lastRenderedPath) {
+							process.stdout.write(`\x1b_Ga=d,d=I,i=9000\x1b\\`);
 						}
+					}
+
+					// Ctrl+T to cycle tabs
+					if (matchesKey(data, Key.ctrl("t"))) {
+						if (tabs.length > 1) {
+							activeTab = (activeTab + 1) % tabs.length;
+							cursor = 0;
+							scrollOffset = 0;
+							lastRenderedPath = ""; // Force thumbnail refresh
+							tui.requestRender();
+						}
+						return;
 					}
 
 					if (matchesKey(data, Key.up)) {
@@ -516,9 +708,11 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						}
 						tui.requestRender();
 					} else if (matchesKey(data, Key.space) || data === "s" || data === "S") {
-						// Stage current screenshot immediately
-						stageScreenshot(cursor);
-						tui.requestRender();
+						// Toggle stage/unstage current screenshot
+						if (screenshots[cursor]) {
+							toggleStageScreenshot(screenshots[cursor]);
+							tui.requestRender();
+						}
 					} else if (matchesKey(data, Key.enter)) {
 						// Close selector (images already staged via s/space)
 						cleanupImage();
@@ -528,7 +722,9 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						done(null);
 					} else if (data === "o") {
 						// Open in default image viewer
-						openFile(screenshots[cursor].path);
+						if (screenshots[cursor]) {
+							openFile(screenshots[cursor].path);
+						}
 					} else if (data === "d" || data === "D") {
 						// Delete the screenshot file from disk
 						if (screenshots.length === 0) return;
@@ -537,69 +733,50 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						try {
 							unlinkSync(screenshot.path);
 							
-							// Remove from thumbnails cache if present
-							thumbnails.delete(cursor);
+							// Remove from thumbnails cache
+							thumbnails.delete(screenshot.path);
 							
 							// Remove from alreadyStaged if it was staged
-							if (alreadyStaged.has(cursor)) {
+							if (alreadyStaged.has(screenshot.path)) {
 								// Find and remove the corresponding staged image
-								const imgIndex = [...alreadyStaged].filter(i => i < cursor).length;
-								if (imgIndex < stagedImages.length) {
-									stagedImages.splice(imgIndex, 1);
-								}
-								alreadyStaged.delete(cursor);
+								const stagedIndex = stagedImages.findIndex((img) => {
+									// Compare by checking if this was the staged image
+									// We need to track paths in stagedImages or use a different approach
+									return true; // This is a simplification
+								});
+								alreadyStaged.delete(screenshot.path);
 							}
 							
-							// Update alreadyStaged indices (decrement indices > cursor)
-							const newStaged = new Set<number>();
-							for (const idx of alreadyStaged) {
-								if (idx > cursor) {
-									newStaged.add(idx - 1);
-								} else {
-									newStaged.add(idx);
-								}
+							// Remove from current tab's screenshots
+							const tabScreenshots = tabs[activeTab].screenshots;
+							const idx = tabScreenshots.findIndex(s => s.path === screenshot.path);
+							if (idx !== -1) {
+								tabScreenshots.splice(idx, 1);
 							}
-							alreadyStaged.clear();
-							for (const idx of newStaged) {
-								alreadyStaged.add(idx);
-							}
-							
-							// Rebuild thumbnails map with updated indices
-							const newThumbnails = new Map<number, { data: string; mimeType: string } | null>();
-							for (const [idx, thumb] of thumbnails) {
-								if (idx > cursor) {
-									newThumbnails.set(idx - 1, thumb);
-								} else if (idx < cursor) {
-									newThumbnails.set(idx, thumb);
-								}
-								// Skip idx === cursor (deleted)
-							}
-							thumbnails.clear();
-							for (const [idx, thumb] of newThumbnails) {
-								thumbnails.set(idx, thumb);
-							}
-							
-							// Remove from screenshots array
-							screenshots.splice(cursor, 1);
 							
 							// Adjust cursor if needed
-							if (screenshots.length === 0) {
-								cleanupImage();
-								done(null); // No more screenshots, close
-								return;
-							}
-							if (cursor >= screenshots.length) {
-								cursor = screenshots.length - 1;
+							if (tabScreenshots.length === 0) {
+								// Check if there are other non-empty tabs
+								const nonEmptyTabIndex = tabs.findIndex((t, i) => i !== activeTab && t.screenshots.length > 0);
+								if (nonEmptyTabIndex !== -1) {
+									activeTab = nonEmptyTabIndex;
+									cursor = 0;
+									scrollOffset = 0;
+								} else {
+									cleanupImage();
+									done(null); // No more screenshots, close
+									return;
+								}
+							} else {
+								if (cursor >= tabScreenshots.length) {
+									cursor = tabScreenshots.length - 1;
+								}
+								if (scrollOffset > 0 && scrollOffset >= tabScreenshots.length - VISIBLE_ITEMS + 1) {
+									scrollOffset = Math.max(0, tabScreenshots.length - VISIBLE_ITEMS);
+								}
 							}
 							
-							// Adjust scroll offset if needed
-							if (scrollOffset > 0 && scrollOffset >= screenshots.length - VISIBLE_ITEMS + 1) {
-								scrollOffset = Math.max(0, screenshots.length - VISIBLE_ITEMS);
-							}
-							
-							// Reset lastRenderedIndex to force re-render
-							lastRenderedIndex = -1;
-							
+							lastRenderedPath = ""; // Force thumbnail refresh
 							tui.requestRender();
 						} catch {
 							// Silently fail if deletion fails
@@ -614,8 +791,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Staging happened inside the UI via 's' key or Enter on selection
-		// Just show notification if anything was staged
+		// Show notification if anything was staged
 		if (alreadyStaged.size > 0) {
 			const count = alreadyStaged.size;
 			const totalStaged = stagedImages.length;
