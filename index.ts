@@ -495,6 +495,14 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					// Nothing to invalidate
 				},
 				handleInput(data: string) {
+					// Helper to clean up displayed image before exiting
+					function cleanupImage() {
+						if (lastRenderedIndex !== -1) {
+							// Delete the Kitty graphics image
+							process.stdout.write(`\x1b_Ga=d,d=I,i=${9000 + lastRenderedIndex}\x1b\\`);
+						}
+					}
+
 					if (matchesKey(data, Key.up)) {
 						cursor = Math.max(0, cursor - 1);
 						if (cursor < scrollOffset) {
@@ -513,8 +521,10 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						tui.requestRender();
 					} else if (matchesKey(data, Key.enter)) {
 						// Close selector (images already staged via s/space)
+						cleanupImage();
 						done([]);
 					} else if (matchesKey(data, Key.escape)) {
+						cleanupImage();
 						done(null);
 					} else if (data === "o") {
 						// Open in default image viewer
@@ -574,6 +584,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 							
 							// Adjust cursor if needed
 							if (screenshots.length === 0) {
+								cleanupImage();
 								done(null); // No more screenshots, close
 								return;
 							}

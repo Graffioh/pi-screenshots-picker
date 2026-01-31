@@ -1,6 +1,6 @@
 {
   "name": "pi-screenshots-picker",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Screenshot picker extension for pi coding agent - quickly select and attach screenshots to your prompts",
   "type": "module",
   "keywords": [
