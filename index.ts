@@ -412,8 +412,8 @@ SERVICE_NAME="${serviceName}"
 
 # SSH/SCP commands (with options to avoid prompts when running as daemon)
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-SSH_CMD="ssh${portFlag} \\$SSH_OPTS"
-SCP_CMD="scp${scpPortFlag} \\$SSH_OPTS"
+SSH_CMD="ssh${portFlag} \$SSH_OPTS"
+SCP_CMD="scp${scpPortFlag} \$SSH_OPTS"
 
 # Expand ~ for local path
 LOCAL_WATCH="\${LOCAL_WATCH/#\\~/$HOME}"
