@@ -93,6 +93,7 @@ interface SourceTab {
 interface SSHSyncConfig {
 	localWatch?: string;
 	remoteDir?: string;
+	port?: number;
 }
 
 interface Config {
@@ -368,7 +369,10 @@ function loadImageBase64(path: string): { data: string; mimeType: string } {
 function generateSSHSyncScript(config: SSHSyncConfig, remoteHost: string): string {
 	const localWatch = config.localWatch || "~/Desktop";
 	const remoteDir = config.remoteDir || "~/Screenshots";
+	const port = config.port;
 	const serviceName = `pi-ss-sync-${remoteHost.replace(/[@.]/g, "-")}`;
+	const portFlag = port ? ` -p ${port}` : "";
+	const scpPortFlag = port ? ` -P ${port}` : "";
 
 	return `#!/bin/bash
 # Screenshot sync script for pi-screenshots-picker
@@ -387,6 +391,10 @@ LOCAL_WATCH="${localWatch}"
 REMOTE_HOST="${remoteHost}"
 REMOTE_DIR="${remoteDir}"
 SERVICE_NAME="${serviceName}"
+
+# SSH/SCP commands
+SSH_CMD="ssh${portFlag}"
+SCP_CMD="scp${scpPortFlag}"
 
 # Expand ~ for local path
 LOCAL_WATCH="\${LOCAL_WATCH/#\\~/$HOME}"
@@ -431,7 +439,7 @@ do_sync() {
     ensure_fswatch
     
     # Ensure remote directory exists
-    ssh "$REMOTE_HOST" "mkdir -p $REMOTE_DIR" 2>/dev/null
+    $SSH_CMD "$REMOTE_HOST" "mkdir -p $REMOTE_DIR" 2>/dev/null
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') Starting screenshot sync"
     echo "  Watching: $LOCAL_WATCH"
@@ -441,7 +449,7 @@ do_sync() {
     fswatch -0 "$LOCAL_WATCH" | while read -d "" file; do
         if [[ "$file" == *.png ]] && [[ "$(basename "$file")" == Screenshot* ]]; then
             echo "$(date '+%H:%M:%S') Syncing: $(basename "$file")"
-            scp -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null
+            $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null
         fi
     done
 }

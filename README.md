@@ -151,19 +151,13 @@ When you're developing on a remote machine via SSH but want to share screenshots
 
 ### Setup
 
-1. **On the remote machine** (where pi runs), run:
+1. **On the remote machine** (where pi runs via SSH), run:
    ```
    /ss-ssh-sync
    ```
-   This outputs a script and creates `~/Screenshots` directory.
+   Press `c` to copy the install command to clipboard.
 
-2. **Copy the script** to your local machine as `~/ss-sync.sh`
-
-3. **Install automatic sync** on your local machine:
-   ```bash
-   chmod +x ~/ss-sync.sh
-   ~/ss-sync.sh install
-   ```
+2. **On your LOCAL machine** (in a separate terminal, not SSH), paste and run.
 
 That's it! The sync runs as a background service and starts automatically on login.
 
@@ -214,7 +208,8 @@ You can customize the paths in `~/.pi/agent/settings.json` on the remote machine
     "sources": ["~/Screenshots"],
     "sshSync": {
       "localWatch": "~/Desktop",
-      "remoteDir": "~/Screenshots"
+      "remoteDir": "~/Screenshots",
+      "port": 22
     }
   }
 }
@@ -222,6 +217,7 @@ You can customize the paths in `~/.pi/agent/settings.json` on the remote machine
 
 - `localWatch` - Directory to watch on your local machine (default: `~/Desktop`)
 - `remoteDir` - Directory on remote where screenshots are synced (default: `~/Screenshots`)
+- `port` - SSH port (default: `22`, useful for Docker or custom SSH setups)
 
 ### Requirements for SSH Sync
 
