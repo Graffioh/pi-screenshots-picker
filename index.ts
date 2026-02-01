@@ -633,6 +633,9 @@ EOF
     echo ""
     echo "Sync will start automatically on login."
     echo "Use '$0 status' to check, '$0 uninstall' to remove."
+    echo ""
+    echo "📌 IMPORTANT: Restart pi on the remote SSH session to see synced screenshots."
+    echo "   Exit pi (Ctrl+C) and run 'pi' again, then use /ss"
 }
 
 install_linux() {
@@ -687,6 +690,9 @@ EOF
     echo ""
     echo "Sync will start automatically on login."
     echo "Use 'systemctl --user status $SERVICE_NAME' to check."
+    echo ""
+    echo "📌 IMPORTANT: Restart pi on the remote SSH session to see synced screenshots."
+    echo "   Exit pi (Ctrl+C) and run 'pi' again, then use /ss"
 }
 
 uninstall_macos() {

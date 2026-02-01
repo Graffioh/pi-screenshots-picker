@@ -159,6 +159,11 @@ When you're developing on a remote machine via SSH but want to share screenshots
 
 2. **On your LOCAL machine** (in a separate terminal, not SSH), paste and run.
 
+3. **Restart pi on the remote** to see synced screenshots:
+   - Exit pi (`Ctrl+C` or `/exit`)
+   - Run `pi` again
+   - Use `/ss` to see your screenshots
+
 That's it! The sync runs as a background service and starts automatically on login.
 
 ### Managing the sync service
