@@ -94,6 +94,7 @@ interface SSHSyncConfig {
 	localWatch?: string;
 	remoteDir?: string;
 	port?: number;
+	host?: string; // Override detected hostname (useful for Docker: "localhost")
 }
 
 interface Config {
@@ -1287,7 +1288,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			const remoteHost = `${sshInfo.user}@${sshInfo.host}`;
+			const hostOverride = syncConfig.host || sshInfo.host;
+			const remoteHost = `${sshInfo.user}@${hostOverride}`;
 			const script = generateSSHSyncScript(syncConfig, remoteHost);
 			const scriptLines = script.split("\n");
 
