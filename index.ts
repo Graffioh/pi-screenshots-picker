@@ -65,7 +65,10 @@
  *   - The script does initial sync + watches for new screenshots
  *
  *   sshSync config options:
- *   - localWatch: Path on LOCAL machine where screenshots are saved (default: ~/Desktop)
+ *   - localWatch: Path on LOCAL machine where screenshots are saved (default: ~/Screenshots)
+ *                 NOTE: On macOS, avoid ~/Desktop, ~/Documents, ~/Downloads - they require
+ *                 Full Disk Access permission for LaunchAgents. Use ~/Screenshots instead,
+ *                 or change macOS screenshot location: defaults write com.apple.screencapture location ~/Screenshots
  *   - remoteDir: Path on REMOTE machine where screenshots are synced to (default: ~/Screenshots)
  *   - host: Hostname/IP your LOCAL machine uses to reach the remote (required for Docker/AWS)
  *   - port: SSH port if non-standard (e.g., 2222 for Docker)
@@ -382,7 +385,7 @@ function loadImageBase64(path: string): { data: string; mimeType: string } {
  * for automatic startup.
  */
 function generateSSHSyncScript(config: SSHSyncConfig, remoteHost: string): string {
-	const localWatch = config.localWatch || "~/Desktop";
+	const localWatch = config.localWatch || "~/Screenshots";
 	const remoteDir = config.remoteDir || "~/Screenshots";
 	const port = config.port;
 	const serviceName = `pi-ss-sync-${remoteHost.replace(/[@.]/g, "-")}`;
@@ -407,9 +410,10 @@ REMOTE_HOST="${remoteHost}"
 REMOTE_DIR="${remoteDir}"
 SERVICE_NAME="${serviceName}"
 
-# SSH/SCP commands
-SSH_CMD="ssh${portFlag}"
-SCP_CMD="scp${scpPortFlag}"
+# SSH/SCP commands (with options to avoid prompts when running as daemon)
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+SSH_CMD="ssh${portFlag} \\$SSH_OPTS"
+SCP_CMD="scp${scpPortFlag} \\$SSH_OPTS"
 
 # Expand ~ for local path
 LOCAL_WATCH="\${LOCAL_WATCH/#\\~/$HOME}"
@@ -453,6 +457,25 @@ ensure_fswatch() {
 do_sync() {
     ensure_fswatch
     
+    # Get SSH_AUTH_SOCK if not set (needed when running as daemon)
+    if [[ -z "$SSH_AUTH_SOCK" ]]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS: get from launchd
+            export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK 2>/dev/null)
+        else
+            # Linux: try common locations
+            for sock in /run/user/$(id -u)/ssh-agent.socket \
+                        /run/user/$(id -u)/keyring/ssh \
+                        /tmp/ssh-*/agent.* \
+                        $HOME/.ssh/ssh_auth_sock; do
+                if [[ -S "$sock" ]]; then
+                    export SSH_AUTH_SOCK="$sock"
+                    break
+                fi
+            done
+        fi
+    fi
+    
     # Ensure remote directory exists
     $SSH_CMD "$REMOTE_HOST" "mkdir -p $REMOTE_DIR" 2>/dev/null
     
@@ -460,11 +483,22 @@ do_sync() {
     echo "  Watching: $LOCAL_WATCH"
     echo "  Syncing to: $REMOTE_HOST:$REMOTE_DIR"
     
+    # Function to check if a file is a screenshot (supports macOS and Linux patterns)
+    is_screenshot() {
+        local name="$(basename "$1")"
+        case "$name" in
+            Screenshot*.png|Capture*.png|Scherm*.png|Bildschirmfoto*.png|Captura*.png|Istantanea*.png) return 0 ;;  # macOS patterns
+            screenshot*.png|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.png) return 0 ;;  # Linux: generic, GNOME
+            flameshot*.png|spectacle*.png|scrot*.png|maim*.png|grim*.png) return 0 ;;  # Linux tools
+            *) return 1 ;;
+        esac
+    }
+    
     # Initial sync of existing screenshots
     echo "$(date '+%H:%M:%S') Initial sync of existing screenshots..."
     initial_count=0
-    for file in "$LOCAL_WATCH"/Screenshot*.png; do
-        if [[ -f "$file" ]]; then
+    for file in "$LOCAL_WATCH"/*.png; do
+        if [[ -f "$file" ]] && is_screenshot "$file"; then
             $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null && ((initial_count++))
         fi
     done
@@ -475,7 +509,7 @@ do_sync() {
     # Watch and sync new screenshots
     echo "$(date '+%H:%M:%S') Watching for new screenshots..."
     fswatch -0 "$LOCAL_WATCH" | while read -d "" file; do
-        if [[ "$file" == *.png ]] && [[ "$(basename "$file")" == Screenshot* ]]; then
+        if [[ "$file" == *.png ]] && is_screenshot "$file"; then
             echo "$(date '+%H:%M:%S') Syncing: $(basename "$file")"
             $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null
         fi
@@ -494,10 +528,59 @@ install_macos() {
         echo ""
     fi
     
+    # Check if localWatch is a protected directory and auto-create symlink
+    ACTUAL_WATCH="$LOCAL_WATCH"
+    case "$LOCAL_WATCH" in
+        */Desktop*|*/Documents*|*/Downloads*)
+            echo ""
+            echo "⚠️  $LOCAL_WATCH is a macOS protected directory."
+            echo "   LaunchAgents cannot access it without Full Disk Access."
+            echo ""
+            echo "   Auto-creating symlink workaround..."
+            
+            # Use ~/Screenshots as the actual watch directory
+            SAFE_DIR="$HOME/Screenshots"
+            mkdir -p "$SAFE_DIR"
+            
+            if [[ -L "$LOCAL_WATCH" ]]; then
+                # Already a symlink - check if it points to our safe dir
+                link_target=$(readlink "$LOCAL_WATCH")
+                if [[ "$link_target" == "$SAFE_DIR" ]]; then
+                    echo "   ✓ Symlink already exists: $LOCAL_WATCH → $SAFE_DIR"
+                else
+                    echo "   ✓ Existing symlink: $LOCAL_WATCH → $link_target"
+                    SAFE_DIR="$link_target"
+                fi
+            elif [[ -d "$LOCAL_WATCH" ]]; then
+                # Directory exists - move contents and create symlink
+                echo "   Moving existing files from $LOCAL_WATCH to $SAFE_DIR..."
+                mv "$LOCAL_WATCH"/*.png "$SAFE_DIR/" 2>/dev/null
+                rmdir "$LOCAL_WATCH" 2>/dev/null || rm -rf "$LOCAL_WATCH"
+                ln -s "$SAFE_DIR" "$LOCAL_WATCH"
+                echo "   ✓ Created symlink: $LOCAL_WATCH → $SAFE_DIR"
+            else
+                # Doesn't exist - just create the symlink
+                mkdir -p "$(dirname "$LOCAL_WATCH")"
+                ln -s "$SAFE_DIR" "$LOCAL_WATCH"
+                echo "   ✓ Created symlink: $LOCAL_WATCH → $SAFE_DIR"
+            fi
+            
+            # Update the actual watch directory
+            ACTUAL_WATCH="$SAFE_DIR"
+            echo "   LaunchAgent will watch: $ACTUAL_WATCH"
+            echo ""
+            ;;
+    esac
+    
     # Create directory and copy script
     mkdir -p "$(dirname "$SCRIPT_PATH")"
     cp "$0" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
+    
+    # Update the installed script to use the actual (safe) watch directory
+    if [[ "$ACTUAL_WATCH" != "$LOCAL_WATCH" ]]; then
+        sed -i '' "s|^LOCAL_WATCH=.*|LOCAL_WATCH=\\"$ACTUAL_WATCH\\"|" "$SCRIPT_PATH"
+    fi
     
     # Create LaunchAgent plist
     mkdir -p "$(dirname "$PLIST_PATH")"
@@ -525,10 +608,20 @@ install_macos() {
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>SSH_AUTH_SOCK</key>
+        <string>\${SSH_AUTH_SOCK:-}</string>
     </dict>
 </dict>
 </plist>
 EOF
+
+    # Capture current SSH_AUTH_SOCK for the plist
+    if [[ -n "$SSH_AUTH_SOCK" ]]; then
+        sed -i '' "s|\\\${SSH_AUTH_SOCK:-}|$SSH_AUTH_SOCK|g" "$PLIST_PATH"
+    else
+        # Remove the SSH_AUTH_SOCK entry if not set
+        sed -i '' '/<key>SSH_AUTH_SOCK<\\/key>/,/<\\/string>/d' "$PLIST_PATH"
+    fi
 
     # Load the agent
     launchctl unload "$PLIST_PATH" 2>/dev/null
@@ -561,6 +654,13 @@ install_linux() {
     
     # Create systemd user service
     mkdir -p "$(dirname "$SYSTEMD_PATH")"
+    
+    # Capture SSH_AUTH_SOCK if available
+    SSH_SOCK_ENV=""
+    if [[ -n "$SSH_AUTH_SOCK" ]]; then
+        SSH_SOCK_ENV="Environment=SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+    fi
+    
     cat > "$SYSTEMD_PATH" << EOF
 [Unit]
 Description=Pi Screenshot Sync to $REMOTE_HOST
@@ -571,6 +671,7 @@ ExecStart=$SCRIPT_PATH run
 Restart=always
 RestartSec=10
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+$SSH_SOCK_ENV
 
 [Install]
 WantedBy=default.target

@@ -200,24 +200,87 @@ LOCAL MACHINE                              REMOTE MACHINE
 
 ### Configuration
 
-You can customize the paths in `~/.pi/agent/settings.json` on the remote machine:
+You can customize the paths in `~/.pi/agent/settings.json` on the **remote machine** (where pi runs):
 
 ```json
 {
   "pi-screenshots": {
     "sources": ["~/Screenshots"],
     "sshSync": {
-      "localWatch": "~/Desktop",
+      "localWatch": "~/Screenshots",
       "remoteDir": "~/Screenshots",
+      "host": "your-server.com",
       "port": 22
     }
   }
 }
 ```
 
-- `localWatch` - Directory to watch on your local machine (default: `~/Desktop`)
+- `localWatch` - Directory to watch on your local machine (default: `~/Screenshots`)
 - `remoteDir` - Directory on remote where screenshots are synced (default: `~/Screenshots`)
+- `host` - Hostname/IP your local machine uses to reach the remote (required for Docker containers or AWS instances where the auto-detected hostname won't resolve)
 - `port` - SSH port (default: `22`, useful for Docker or custom SSH setups)
+
+### macOS: Protected Directories (Automatic Symlink)
+
+On macOS, **LaunchAgents cannot access `~/Desktop`, `~/Documents`, or `~/Downloads`** without Full Disk Access. The install script **automatically handles this** by creating a symlink:
+
+```
+~/Desktop/ss (your configured path)
+      ↓ symlink
+~/Screenshots (actual storage, accessible by LaunchAgent)
+```
+
+**What happens automatically on install:**
+1. Creates `~/Screenshots` directory
+2. Moves existing screenshots from your configured path to `~/Screenshots`
+3. Creates a symlink so macOS still saves to your configured location
+4. LaunchAgent watches `~/Screenshots` (no permission issues)
+
+**Example:** If you configure `localWatch: "~/Desktop/ss"`:
+- macOS saves screenshot → `~/Desktop/ss/Screenshot.png`
+- Symlink redirects → `~/Screenshots/Screenshot.png` (actual file)
+- LaunchAgent syncs from `~/Screenshots` ✓
+
+**Alternative approaches:**
+
+1. **Change macOS screenshot location directly:**
+   ```bash
+   defaults write com.apple.screencapture location ~/Screenshots
+   killall SystemUIServer
+   ```
+
+2. **Grant Full Disk Access to `/bin/bash`:**
+   - System Settings → Privacy & Security → Full Disk Access
+   - Click `+`, press `Cmd+Shift+G`, type `/bin/bash`
+   - (Grants access to all bash scripts - less secure)
+
+### Docker / Cloud VM Setup
+
+When the remote is a Docker container or cloud instance, the auto-detected hostname often won't resolve from your local machine. You must specify the `host` explicitly:
+
+**Docker example:**
+```json
+{
+  "pi-screenshots": {
+    "sshSync": {
+      "host": "localhost",
+      "port": 2222
+    }
+  }
+}
+```
+
+**AWS EC2 example:**
+```json
+{
+  "pi-screenshots": {
+    "sshSync": {
+      "host": "ec2-1-2-3-4.compute.amazonaws.com"
+    }
+  }
+}
+```
 
 ### Requirements for SSH Sync
 
