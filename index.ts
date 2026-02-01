@@ -57,10 +57,24 @@
  *   - Plain directories: scans for screenshot-named PNGs
  *   - Glob patterns: matches any file matching the pattern
  *
- *   SSH Sync Mode:
- *   - For remote development via SSH
- *   - Run /ss-ssh-sync to get a script for your local machine
- *   - Script watches for screenshots and syncs them to the remote
+ *   SSH Sync Mode (config goes on the REMOTE machine where pi runs):
+ *   - For remote development via SSH (e.g., dev containers, cloud VMs)
+ *   - Configure sshSync in the REMOTE machine's ~/.pi/agent/settings.json
+ *   - Run /ss-ssh-sync on the remote to get a script for your local machine
+ *   - Copy and run the script on your LOCAL machine to sync screenshots
+ *   - The script does initial sync + watches for new screenshots
+ *
+ *   sshSync config options:
+ *   - localWatch: Path on LOCAL machine where screenshots are saved (default: ~/Desktop)
+ *   - remoteDir: Path on REMOTE machine where screenshots are synced to (default: ~/Screenshots)
+ *   - host: Hostname/IP your LOCAL machine uses to reach the remote (required for Docker/AWS)
+ *   - port: SSH port if non-standard (e.g., 2222 for Docker)
+ *
+ *   Example for Docker:
+ *   { "pi-screenshots": { "sshSync": { "host": "localhost", "port": 2222 } } }
+ *
+ *   Example for AWS EC2:
+ *   { "pi-screenshots": { "sshSync": { "host": "ec2-1-2-3-4.compute.amazonaws.com" } } }
  *
  *   Environment variable PI_SCREENSHOTS_DIR is also supported as fallback.
  *
@@ -446,7 +460,20 @@ do_sync() {
     echo "  Watching: $LOCAL_WATCH"
     echo "  Syncing to: $REMOTE_HOST:$REMOTE_DIR"
     
-    # Watch and sync
+    # Initial sync of existing screenshots
+    echo "$(date '+%H:%M:%S') Initial sync of existing screenshots..."
+    initial_count=0
+    for file in "$LOCAL_WATCH"/Screenshot*.png; do
+        if [[ -f "$file" ]]; then
+            $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null && ((initial_count++))
+        fi
+    done
+    if [[ $initial_count -gt 0 ]]; then
+        echo "$(date '+%H:%M:%S') Synced $initial_count existing screenshot(s)"
+    fi
+    
+    # Watch and sync new screenshots
+    echo "$(date '+%H:%M:%S') Watching for new screenshots..."
     fswatch -0 "$LOCAL_WATCH" | while read -d "" file; do
         if [[ "$file" == *.png ]] && [[ "$(basename "$file")" == Screenshot* ]]; then
             echo "$(date '+%H:%M:%S') Syncing: $(basename "$file")"
@@ -660,19 +687,45 @@ esac
 }
 
 /**
+ * Check if a hostname looks like it won't be resolvable from outside.
+ * Returns a warning message if problematic, null if OK.
+ */
+function getHostnameWarning(host: string): string | null {
+	// Docker container IDs (12+ hex chars)
+	if (/^[0-9a-f]{12,}$/i.test(host)) {
+		return `Hostname "${host}" looks like a Docker container ID and won't resolve from your local machine.`;
+	}
+
+	// AWS internal hostnames
+	if (/^ip-\d+-\d+-\d+-\d+\..*\.internal$/i.test(host)) {
+		return `Hostname "${host}" is an AWS internal hostname and won't resolve from outside AWS.`;
+	}
+
+	// Generic .internal or .local that might not resolve
+	if (/\.(internal|local|localdomain)$/i.test(host)) {
+		return `Hostname "${host}" may not resolve from your local machine.`;
+	}
+
+	return null;
+}
+
+/**
  * Try to detect the current SSH connection info.
  */
-function getSSHConnectionInfo(): { host: string; user: string } | null {
+function getSSHConnectionInfo(): { host: string; user: string; warning?: string } | null {
 	// SSH_CONNECTION format: "client_ip client_port server_ip server_port"
 	const sshConnection = process.env.SSH_CONNECTION;
 	const sshClient = process.env.SSH_CLIENT;
 	const user = process.env.USER || process.env.LOGNAME || "user";
 
 	if (sshConnection || sshClient) {
-		// We're in an SSH session, return this machine's hostname
+		const detectedHost = hostname();
+		const warning = getHostnameWarning(detectedHost);
+
 		return {
-			host: hostname(),
+			host: detectedHost,
 			user,
+			warning: warning || undefined,
 		};
 	}
 
@@ -1278,6 +1331,15 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			const syncConfig = config.sshSync || {};
 			const remoteDir = syncConfig.remoteDir || "~/Screenshots";
 
+			// Check if sshSync config exists on remote
+			const hasConfig = config.sshSync !== undefined;
+
+			// Check for hostname issues if no host override
+			let hostnameWarning: string | null = null;
+			if (!syncConfig.host && sshInfo.warning) {
+				hostnameWarning = sshInfo.warning;
+			}
+
 			// Ensure the remote directory exists
 			const expandedRemoteDir = expandPath(remoteDir);
 			if (!existsSync(expandedRemoteDir)) {
@@ -1292,6 +1354,20 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			const remoteHost = `${sshInfo.user}@${hostOverride}`;
 			const script = generateSSHSyncScript(syncConfig, remoteHost);
 			const scriptLines = script.split("\n");
+
+			// Show warnings if needed
+			if (!hasConfig) {
+				ctx.ui.notify(
+					"No sshSync config found. Add to REMOTE ~/.pi/agent/settings.json:\n" +
+					'{ "pi-screenshots": { "sshSync": { "localWatch": "~/Desktop", "host": "your-server" } } }',
+					"warning"
+				);
+			} else if (hostnameWarning) {
+				ctx.ui.notify(
+					`${hostnameWarning}\nAdd "host" to your sshSync config with the hostname/IP your local machine can reach.`,
+					"warning"
+				);
+			}
 
 			// Generate one-liner that creates file, makes executable, and runs install
 			const installCommand = `cat > ~/ss-sync.sh << 'PI_SS_SYNC_EOF'
@@ -1309,15 +1385,24 @@ chmod +x ~/ss-sync.sh && ~/ss-sync.sh install`;
 					try {
 						if (process.platform === "darwin") {
 							execSync("pbcopy", { input: text });
+							return true;
 						} else {
 							// Try xclip first, then xsel
 							try {
 								execSync("xclip -selection clipboard", { input: text });
+								return true;
 							} catch {
-								execSync("xsel --clipboard --input", { input: text });
+								try {
+									execSync("xsel --clipboard --input", { input: text });
+									return true;
+								} catch {
+									// Fallback: OSC 52 escape sequence (works over SSH with Ghostty, iTerm2, Kitty, WezTerm)
+									const b64 = Buffer.from(text).toString("base64");
+									process.stdout.write(`\x1b]52;c;${b64}\x07`);
+									return true;
+								}
 							}
 						}
-						return true;
 					} catch {
 						return false;
 					}
