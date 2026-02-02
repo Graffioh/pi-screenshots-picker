@@ -8,7 +8,6 @@
  * - Shows all recent screenshots with scrollable list
  * - Multiple source directories with tabs (Ctrl+T to cycle)
  * - Supports glob patterns for flexible file matching
- * - SSH sync mode for remote development (screenshots synced from local machine)
  * - Displays relative timestamps (e.g., "2 minutes ago")
  * - Shows thumbnail preview of selected screenshot
  * - Press 'o' to open in default image viewer
@@ -19,7 +18,6 @@
  * Usage:
  *   /ss              - Show screenshot selector (stages images)
  *   /ssclear         - Clear staged screenshots
- *   /ss-ssh-sync     - Show script to run on local machine for SSH sync mode
  *   Ctrl+Shift+S     - Quick access shortcut
  *
  * Keys:
@@ -45,11 +43,7 @@
  *       "sources": [
  *         "~/Pictures/Screenshots",
  *         "/path/to/images/*.png"
- *       ],
- *       "sshSync": {
- *         "localWatch": "~/Desktop",
- *         "remoteDir": "~/Screenshots"
- *       }
+ *       ]
  *     }
  *   }
  *
@@ -57,38 +51,22 @@
  *   - Plain directories: scans for screenshot-named PNGs
  *   - Glob patterns: matches any file matching the pattern
  *
- *   SSH Sync Mode (config goes on the REMOTE machine where pi runs):
- *   - For remote development via SSH (e.g., dev containers, cloud VMs)
- *   - Configure sshSync in the REMOTE machine's ~/.pi/agent/settings.json
- *   - Run /ss-ssh-sync on the remote to get a script for your local machine
- *   - Copy and run the script on your LOCAL machine to sync screenshots
- *   - The script does initial sync + watches for new screenshots
- *
- *   sshSync config options:
- *   - localWatch: Path on LOCAL machine where screenshots are saved (default: ~/Screenshots)
- *                 NOTE: On macOS, avoid ~/Desktop, ~/Documents, ~/Downloads - they require
- *                 Full Disk Access permission for LaunchAgents. Use ~/Screenshots instead,
- *                 or change macOS screenshot location: defaults write com.apple.screencapture location ~/Screenshots
- *   - remoteDir: Path on REMOTE machine where screenshots are synced to (default: ~/Screenshots)
- *   - host: Hostname/IP your LOCAL machine uses to reach the remote (required for Docker/AWS)
- *   - port: SSH port if non-standard (e.g., 2222 for Docker)
- *
- *   Example for Docker:
- *   { "pi-screenshots": { "sshSync": { "host": "localhost", "port": 2222 } } }
- *
- *   Example for AWS EC2:
- *   { "pi-screenshots": { "sshSync": { "host": "ec2-1-2-3-4.compute.amazonaws.com" } } }
- *
  *   Environment variable PI_SCREENSHOTS_DIR is also supported as fallback.
  *
  * Default screenshot locations (when no config):
  *   macOS: reads from screencapture preferences, falls back to ~/Desktop
  *   Linux: ~/Pictures/Screenshots, ~/Pictures, ~/Screenshots, or ~/Desktop
+ *
+ * Remote Development:
+ *   For remote development via SSH, use external sync tools:
+ *   - SSHFS: Mount remote folder locally (simplest)
+ *   - Syncthing: Continuous file sync (most robust)
+ *   See README for details.
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ImageContent } from "@mariozechner/pi-coding-agent";
 import { Image, Key, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
@@ -107,16 +85,8 @@ interface SourceTab {
 	screenshots: ScreenshotInfo[];
 }
 
-interface SSHSyncConfig {
-	localWatch?: string;
-	remoteDir?: string;
-	port?: number;
-	host?: string; // Override detected hostname (useful for Docker: "localhost")
-}
-
 interface Config {
 	sources?: string[];
-	sshSync?: SSHSyncConfig;
 }
 
 const SCREENSHOT_PATTERNS = [
@@ -379,466 +349,6 @@ function loadImageBase64(path: string): { data: string; mimeType: string } {
 	};
 }
 
-/**
- * Generate the SSH sync script for the local machine.
- * This script can install itself as a LaunchAgent (macOS) or systemd service (Linux)
- * for automatic startup.
- */
-function generateSSHSyncScript(config: SSHSyncConfig, remoteHost: string): string {
-	const localWatch = config.localWatch || "~/Screenshots";
-	const remoteDir = config.remoteDir || "~/Screenshots";
-	const port = config.port;
-	const serviceName = `pi-ss-sync-${remoteHost.replace(/[@.]/g, "-")}`;
-	const portFlag = port ? ` -p ${port}` : "";
-	const scpPortFlag = port ? ` -P ${port}` : "";
-
-	return `#!/bin/bash
-# Screenshot sync script for pi-screenshots-picker
-# Automatically syncs screenshots from LOCAL machine to remote
-#
-# Usage:
-#   ./ss-sync.sh install   - Install and start automatic sync (runs on login)
-#   ./ss-sync.sh uninstall - Stop and remove automatic sync
-#   ./ss-sync.sh status    - Check if sync is running
-#   ./ss-sync.sh start     - Manually start sync daemon
-#   ./ss-sync.sh stop      - Stop sync daemon
-#   ./ss-sync.sh run       - Run in foreground (for debugging)
-
-# Configuration
-LOCAL_WATCH="${localWatch}"
-REMOTE_HOST="${remoteHost}"
-REMOTE_DIR="${remoteDir}"
-SERVICE_NAME="${serviceName}"
-
-# SSH/SCP commands (with options to avoid prompts when running as daemon)
-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-SSH_CMD="ssh${portFlag} \$SSH_OPTS"
-SCP_CMD="scp${scpPortFlag} \$SSH_OPTS"
-
-# Expand ~ for local path
-LOCAL_WATCH="\${LOCAL_WATCH/#\\~/$HOME}"
-
-# Paths
-SCRIPT_PATH="$HOME/.pi/ss-sync/$SERVICE_NAME.sh"
-PLIST_PATH="$HOME/Library/LaunchAgents/$SERVICE_NAME.plist"
-SYSTEMD_PATH="$HOME/.config/systemd/user/$SERVICE_NAME.service"
-LOG_PATH="$HOME/.pi/ss-sync/$SERVICE_NAME.log"
-PID_PATH="$HOME/.pi/ss-sync/$SERVICE_NAME.pid"
-
-ensure_fswatch() {
-    if command -v fswatch &> /dev/null; then
-        return 0
-    fi
-    
-    echo "fswatch not found. Installing..."
-    echo ""
-    
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        if command -v brew &> /dev/null; then
-            brew install fswatch
-        else
-            echo "Error: Homebrew not found. Install fswatch manually:"
-            echo "  brew install fswatch"
-            exit 1
-        fi
-    elif command -v apt-get &> /dev/null; then
-        sudo apt-get update && sudo apt-get install -y fswatch
-    elif command -v dnf &> /dev/null; then
-        sudo dnf install -y fswatch
-    elif command -v pacman &> /dev/null; then
-        sudo pacman -S --noconfirm fswatch
-    else
-        echo "Error: Could not auto-install fswatch."
-        echo "Please install manually: https://github.com/emcrisostomo/fswatch"
-        exit 1
-    fi
-}
-
-do_sync() {
-    ensure_fswatch
-    
-    # Get SSH_AUTH_SOCK if not set (needed when running as daemon)
-    if [[ -z "$SSH_AUTH_SOCK" ]]; then
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            # macOS: get from launchd
-            export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK 2>/dev/null)
-        else
-            # Linux: try common locations
-            for sock in /run/user/$(id -u)/ssh-agent.socket \
-                        /run/user/$(id -u)/keyring/ssh \
-                        /tmp/ssh-*/agent.* \
-                        $HOME/.ssh/ssh_auth_sock; do
-                if [[ -S "$sock" ]]; then
-                    export SSH_AUTH_SOCK="$sock"
-                    break
-                fi
-            done
-        fi
-    fi
-    
-    # Ensure remote directory exists
-    $SSH_CMD "$REMOTE_HOST" "mkdir -p $REMOTE_DIR" 2>/dev/null
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Starting screenshot sync"
-    echo "  Watching: $LOCAL_WATCH"
-    echo "  Syncing to: $REMOTE_HOST:$REMOTE_DIR"
-    
-    # Function to check if a file is a screenshot (supports macOS and Linux patterns)
-    is_screenshot() {
-        local name="$(basename "$1")"
-        case "$name" in
-            Screenshot*.png|Capture*.png|Scherm*.png|Bildschirmfoto*.png|Captura*.png|Istantanea*.png) return 0 ;;  # macOS patterns
-            screenshot*.png|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.png) return 0 ;;  # Linux: generic, GNOME
-            flameshot*.png|spectacle*.png|scrot*.png|maim*.png|grim*.png) return 0 ;;  # Linux tools
-            *) return 1 ;;
-        esac
-    }
-    
-    # Initial sync of existing screenshots
-    echo "$(date '+%H:%M:%S') Initial sync of existing screenshots..."
-    initial_count=0
-    for file in "$LOCAL_WATCH"/*.png; do
-        if [[ -f "$file" ]] && is_screenshot "$file"; then
-            $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null && ((initial_count++))
-        fi
-    done
-    if [[ $initial_count -gt 0 ]]; then
-        echo "$(date '+%H:%M:%S') Synced $initial_count existing screenshot(s)"
-    fi
-    
-    # Watch and sync new screenshots
-    echo "$(date '+%H:%M:%S') Watching for new screenshots..."
-    fswatch -0 "$LOCAL_WATCH" | while read -d "" file; do
-        if [[ "$file" == *.png ]] && is_screenshot "$file"; then
-            echo "$(date '+%H:%M:%S') Syncing: $(basename "$file")"
-            $SCP_CMD -q "$file" "$REMOTE_HOST:$REMOTE_DIR/" 2>/dev/null
-        fi
-    done
-}
-
-install_macos() {
-    ensure_fswatch
-    
-    # Reminder for image preview setup
-    if [ -n "$TERM_PROGRAM" ]; then
-        echo ""
-        echo "For thumbnail previews over SSH, add to remote ~/.bashrc or ~/.zshrc:"
-        echo "  export TERM_PROGRAM=$TERM_PROGRAM"
-        echo "(requires pi restart - can't use ! inside pi)"
-        echo ""
-    fi
-    
-    # Check if localWatch is a protected directory and auto-create symlink
-    ACTUAL_WATCH="$LOCAL_WATCH"
-    case "$LOCAL_WATCH" in
-        */Desktop*|*/Documents*|*/Downloads*)
-            echo ""
-            echo "⚠️  $LOCAL_WATCH is a macOS protected directory."
-            echo "   LaunchAgents cannot access it without Full Disk Access."
-            echo ""
-            echo "   Auto-creating symlink workaround..."
-            
-            # Use ~/Screenshots as the actual watch directory
-            SAFE_DIR="$HOME/Screenshots"
-            mkdir -p "$SAFE_DIR"
-            
-            if [[ -L "$LOCAL_WATCH" ]]; then
-                # Already a symlink - check if it points to our safe dir
-                link_target=$(readlink "$LOCAL_WATCH")
-                if [[ "$link_target" == "$SAFE_DIR" ]]; then
-                    echo "   ✓ Symlink already exists: $LOCAL_WATCH → $SAFE_DIR"
-                else
-                    echo "   ✓ Existing symlink: $LOCAL_WATCH → $link_target"
-                    SAFE_DIR="$link_target"
-                fi
-            elif [[ -d "$LOCAL_WATCH" ]]; then
-                # Directory exists - move contents and create symlink
-                echo "   Moving existing files from $LOCAL_WATCH to $SAFE_DIR..."
-                mv "$LOCAL_WATCH"/*.png "$SAFE_DIR/" 2>/dev/null
-                rmdir "$LOCAL_WATCH" 2>/dev/null || rm -rf "$LOCAL_WATCH"
-                ln -s "$SAFE_DIR" "$LOCAL_WATCH"
-                echo "   ✓ Created symlink: $LOCAL_WATCH → $SAFE_DIR"
-            else
-                # Doesn't exist - just create the symlink
-                mkdir -p "$(dirname "$LOCAL_WATCH")"
-                ln -s "$SAFE_DIR" "$LOCAL_WATCH"
-                echo "   ✓ Created symlink: $LOCAL_WATCH → $SAFE_DIR"
-            fi
-            
-            # Update the actual watch directory
-            ACTUAL_WATCH="$SAFE_DIR"
-            echo "   LaunchAgent will watch: $ACTUAL_WATCH"
-            echo ""
-            ;;
-    esac
-    
-    # Create directory and copy script
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    
-    # Update the installed script to use the actual (safe) watch directory
-    if [[ "$ACTUAL_WATCH" != "$LOCAL_WATCH" ]]; then
-        sed -i '' "s|^LOCAL_WATCH=.*|LOCAL_WATCH=\\"$ACTUAL_WATCH\\"|" "$SCRIPT_PATH"
-    fi
-    
-    # Create LaunchAgent plist
-    mkdir -p "$(dirname "$PLIST_PATH")"
-    cat > "$PLIST_PATH" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>$SERVICE_NAME</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$SCRIPT_PATH</string>
-        <string>run</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$LOG_PATH</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_PATH</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-        <key>SSH_AUTH_SOCK</key>
-        <string>\${SSH_AUTH_SOCK:-}</string>
-    </dict>
-</dict>
-</plist>
-EOF
-
-    # Capture current SSH_AUTH_SOCK for the plist
-    if [[ -n "$SSH_AUTH_SOCK" ]]; then
-        sed -i '' "s|\\\${SSH_AUTH_SOCK:-}|$SSH_AUTH_SOCK|g" "$PLIST_PATH"
-    else
-        # Remove the SSH_AUTH_SOCK entry if not set
-        sed -i '' '/<key>SSH_AUTH_SOCK<\\/key>/,/<\\/string>/d' "$PLIST_PATH"
-    fi
-
-    # Load the agent
-    launchctl unload "$PLIST_PATH" 2>/dev/null
-    launchctl load "$PLIST_PATH"
-    
-    echo "✓ Installed and started screenshot sync"
-    echo "  Syncing: $LOCAL_WATCH → $REMOTE_HOST:$REMOTE_DIR"
-    echo "  Log: $LOG_PATH"
-    echo ""
-    echo "Sync will start automatically on login."
-    echo "Use '$0 status' to check, '$0 uninstall' to remove."
-    echo ""
-    echo "📌 IMPORTANT: Restart pi on the remote SSH session to see synced screenshots."
-    echo "   Exit pi (Ctrl+C) and run 'pi' again, then use /ss"
-}
-
-install_linux() {
-    ensure_fswatch
-    
-    # Reminder for image preview setup
-    if [ -n "$TERM_PROGRAM" ]; then
-        echo ""
-        echo "For thumbnail previews over SSH, add to remote ~/.bashrc or ~/.zshrc:"
-        echo "  export TERM_PROGRAM=$TERM_PROGRAM"
-        echo "(requires pi restart - can't use ! inside pi)"
-        echo ""
-    fi
-    
-    # Create directory and copy script
-    mkdir -p "$(dirname "$SCRIPT_PATH")"
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    
-    # Create systemd user service
-    mkdir -p "$(dirname "$SYSTEMD_PATH")"
-    
-    # Capture SSH_AUTH_SOCK if available
-    SSH_SOCK_ENV=""
-    if [[ -n "$SSH_AUTH_SOCK" ]]; then
-        SSH_SOCK_ENV="Environment=SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
-    fi
-    
-    cat > "$SYSTEMD_PATH" << EOF
-[Unit]
-Description=Pi Screenshot Sync to $REMOTE_HOST
-After=network.target
-
-[Service]
-ExecStart=$SCRIPT_PATH run
-Restart=always
-RestartSec=10
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-$SSH_SOCK_ENV
-
-[Install]
-WantedBy=default.target
-EOF
-
-    # Enable and start
-    systemctl --user daemon-reload
-    systemctl --user enable "$SERVICE_NAME"
-    systemctl --user start "$SERVICE_NAME"
-    
-    echo "✓ Installed and started screenshot sync"
-    echo "  Syncing: $LOCAL_WATCH → $REMOTE_HOST:$REMOTE_DIR"
-    echo ""
-    echo "Sync will start automatically on login."
-    echo "Use 'systemctl --user status $SERVICE_NAME' to check."
-    echo ""
-    echo "📌 IMPORTANT: Restart pi on the remote SSH session to see synced screenshots."
-    echo "   Exit pi (Ctrl+C) and run 'pi' again, then use /ss"
-}
-
-uninstall_macos() {
-    launchctl unload "$PLIST_PATH" 2>/dev/null
-    rm -f "$PLIST_PATH"
-    rm -f "$SCRIPT_PATH"
-    rm -f "$LOG_PATH"
-    echo "✓ Uninstalled screenshot sync for $REMOTE_HOST"
-}
-
-uninstall_linux() {
-    systemctl --user stop "$SERVICE_NAME" 2>/dev/null
-    systemctl --user disable "$SERVICE_NAME" 2>/dev/null
-    rm -f "$SYSTEMD_PATH"
-    rm -f "$SCRIPT_PATH"
-    systemctl --user daemon-reload
-    echo "✓ Uninstalled screenshot sync for $REMOTE_HOST"
-}
-
-status_macos() {
-    if launchctl list | grep -q "$SERVICE_NAME"; then
-        echo "✓ Screenshot sync is running"
-        echo "  Syncing: $LOCAL_WATCH → $REMOTE_HOST:$REMOTE_DIR"
-        echo ""
-        echo "Recent log:"
-        tail -5 "$LOG_PATH" 2>/dev/null || echo "  (no log yet)"
-    else
-        echo "✗ Screenshot sync is not running"
-        echo "  Run '$0 install' to set up automatic sync"
-    fi
-}
-
-status_linux() {
-    if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
-        echo "✓ Screenshot sync is running"
-        systemctl --user status "$SERVICE_NAME" --no-pager
-    else
-        echo "✗ Screenshot sync is not running"
-        echo "  Run '$0 install' to set up automatic sync"
-    fi
-}
-
-start_daemon() {
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        launchctl load "$PLIST_PATH" 2>/dev/null
-    else
-        systemctl --user start "$SERVICE_NAME"
-    fi
-    echo "Started screenshot sync"
-}
-
-stop_daemon() {
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        launchctl unload "$PLIST_PATH" 2>/dev/null
-    else
-        systemctl --user stop "$SERVICE_NAME"
-    fi
-    echo "Stopped screenshot sync"
-}
-
-# Main
-case "\${1:-run}" in
-    install)
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            install_macos
-        else
-            install_linux
-        fi
-        ;;
-    uninstall)
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            uninstall_macos
-        else
-            uninstall_linux
-        fi
-        ;;
-    status)
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            status_macos
-        else
-            status_linux
-        fi
-        ;;
-    start)
-        start_daemon
-        ;;
-    stop)
-        stop_daemon
-        ;;
-    run)
-        do_sync
-        ;;
-    *)
-        echo "Usage: $0 {install|uninstall|status|start|stop|run}"
-        exit 1
-        ;;
-esac
-`;
-}
-
-/**
- * Check if a hostname looks like it won't be resolvable from outside.
- * Returns a warning message if problematic, null if OK.
- */
-function getHostnameWarning(host: string): string | null {
-	// Docker container IDs (12+ hex chars)
-	if (/^[0-9a-f]{12,}$/i.test(host)) {
-		return `Hostname "${host}" looks like a Docker container ID and won't resolve from your local machine.`;
-	}
-
-	// AWS internal hostnames
-	if (/^ip-\d+-\d+-\d+-\d+\..*\.internal$/i.test(host)) {
-		return `Hostname "${host}" is an AWS internal hostname and won't resolve from outside AWS.`;
-	}
-
-	// Generic .internal or .local that might not resolve
-	if (/\.(internal|local|localdomain)$/i.test(host)) {
-		return `Hostname "${host}" may not resolve from your local machine.`;
-	}
-
-	return null;
-}
-
-/**
- * Try to detect the current SSH connection info.
- */
-function getSSHConnectionInfo(): { host: string; user: string; warning?: string } | null {
-	// SSH_CONNECTION format: "client_ip client_port server_ip server_port"
-	const sshConnection = process.env.SSH_CONNECTION;
-	const sshClient = process.env.SSH_CLIENT;
-	const user = process.env.USER || process.env.LOGNAME || "user";
-
-	if (sshConnection || sshClient) {
-		const detectedHost = hostname();
-		const warning = getHostnameWarning(detectedHost);
-
-		return {
-			host: detectedHost,
-			user,
-			warning: warning || undefined,
-		};
-	}
-
-	return null;
-}
-
 export default function screenshotsExtension(pi: ExtensionAPI) {
 	const config = loadConfig();
 
@@ -849,18 +359,9 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 	 * Get source tabs based on configuration.
 	 */
 	function getSourceTabs(): SourceTab[] {
-		// If sshSync is configured, include that directory in sources
-		let sources = config.sources && config.sources.length > 0
+		const sources = config.sources && config.sources.length > 0
 			? [...config.sources]
 			: [process.env.PI_SCREENSHOTS_DIR || getDefaultScreenshotDir()];
-
-		// Add sshSync remote directory if configured
-		if (config.sshSync?.remoteDir) {
-			const syncDir = expandPath(config.sshSync.remoteDir);
-			if (!sources.includes(syncDir) && !sources.includes(config.sshSync.remoteDir)) {
-				sources.push(config.sshSync.remoteDir);
-			}
-		}
 
 		return sources.map((source) => {
 			const screenshots = getScreenshotsFromSource(source);
@@ -1421,183 +922,6 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			} else {
 				ctx.ui.notify("No staged screenshots to clear", "info");
 			}
-		},
-	});
-
-	// Register command to show SSH sync script
-	pi.registerCommand("ss-ssh-sync", {
-		description: "Show script to run on local machine for SSH screenshot sync",
-		handler: async (_args, ctx) => {
-			const sshInfo = getSSHConnectionInfo();
-
-			if (!sshInfo) {
-				ctx.ui.notify("Not in an SSH session. This command is for remote development.", "warning");
-				return;
-			}
-
-			const syncConfig = config.sshSync || {};
-			const remoteDir = syncConfig.remoteDir || "~/Screenshots";
-
-			// Check if sshSync config exists on remote
-			const hasConfig = config.sshSync !== undefined;
-
-			// Check for hostname issues if no host override
-			let hostnameWarning: string | null = null;
-			if (!syncConfig.host && sshInfo.warning) {
-				hostnameWarning = sshInfo.warning;
-			}
-
-			// Ensure the remote directory exists
-			const expandedRemoteDir = expandPath(remoteDir);
-			if (!existsSync(expandedRemoteDir)) {
-				try {
-					mkdirSync(expandedRemoteDir, { recursive: true });
-				} catch {
-					// Ignore
-				}
-			}
-
-			const hostOverride = syncConfig.host || sshInfo.host;
-			const remoteHost = `${sshInfo.user}@${hostOverride}`;
-			const script = generateSSHSyncScript(syncConfig, remoteHost);
-			const scriptLines = script.split("\n");
-
-			// Show warnings if needed
-			if (!hasConfig) {
-				ctx.ui.notify(
-					"No sshSync config found. Add to REMOTE ~/.pi/agent/settings.json:\n" +
-					'{ "pi-screenshots": { "sshSync": { "localWatch": "~/Desktop", "host": "your-server" } } }',
-					"warning"
-				);
-			} else if (hostnameWarning) {
-				ctx.ui.notify(
-					`${hostnameWarning}\nAdd "host" to your sshSync config with the hostname/IP your local machine can reach.`,
-					"warning"
-				);
-			}
-
-			// Generate one-liner that creates file, makes executable, and runs install
-			const installCommand = `cat > ~/ss-sync.sh << 'PI_SS_SYNC_EOF'
-${script}
-PI_SS_SYNC_EOF
-chmod +x ~/ss-sync.sh && ~/ss-sync.sh install`;
-
-			// Show scrollable overlay with copy functionality
-			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-				let scrollOffset = 0;
-				let copied = false;
-				const VISIBLE_LINES = 20;
-
-				function copyToClipboard(text: string): boolean {
-					try {
-						if (process.platform === "darwin") {
-							execSync("pbcopy", { input: text });
-							return true;
-						} else {
-							// Try xclip first, then xsel
-							try {
-								execSync("xclip -selection clipboard", { input: text });
-								return true;
-							} catch {
-								try {
-									execSync("xsel --clipboard --input", { input: text });
-									return true;
-								} catch {
-									// Fallback: OSC 52 escape sequence (works over SSH with Ghostty, iTerm2, Kitty, WezTerm)
-									const b64 = Buffer.from(text).toString("base64");
-									process.stdout.write(`\x1b]52;c;${b64}\x07`);
-									return true;
-								}
-							}
-						}
-					} catch {
-						return false;
-					}
-				}
-
-				return {
-					render(width: number) {
-						const maxScroll = Math.max(0, scriptLines.length - VISIBLE_LINES);
-						scrollOffset = Math.min(scrollOffset, maxScroll);
-
-						const lines: string[] = [];
-						const border = theme.fg("accent", "─".repeat(width));
-
-						// Header
-						lines.push(border);
-						lines.push(" " + theme.fg("accent", theme.bold("SSH Screenshot Sync Script")));
-						lines.push(" " + theme.fg("dim", "Press 'c' to copy auto-install command, then paste on LOCAL machine"));
-						lines.push("");
-
-						// Script content (scrollable)
-						const visibleLines = scriptLines.slice(scrollOffset, scrollOffset + VISIBLE_LINES);
-						for (const line of visibleLines) {
-							const displayLine = line.length > width - 2 ? line.slice(0, width - 5) + "..." : line;
-							lines.push(" " + theme.fg("text", displayLine));
-						}
-
-						// Pad to fill content area
-						while (lines.length < VISIBLE_LINES + 4) {
-							lines.push("");
-						}
-
-						// Scroll indicator
-						const scrollPercent = scriptLines.length <= VISIBLE_LINES ? 100 : Math.round((scrollOffset / maxScroll) * 100);
-						const scrollInfo = scriptLines.length > VISIBLE_LINES
-							? theme.fg("dim", ` [${scrollOffset + 1}-${Math.min(scrollOffset + VISIBLE_LINES, scriptLines.length)}/${scriptLines.length}] ${scrollPercent}%`)
-							: "";
-
-						// Footer with instructions
-						lines.push("");
-						const copyStatus = copied ? theme.fg("success", " ✓ Copied! Paste on LOCAL terminal") : "";
-						const footer = ` ${theme.fg("accent", "c")} copy & install  ${theme.fg("accent", "↑↓")} scroll  ${theme.fg("accent", "esc")} close${copyStatus}${scrollInfo}`;
-						lines.push(footer);
-						lines.push(border);
-
-						return lines;
-					},
-					invalidate() {
-						// Nothing to invalidate
-					},
-					handleInput(data: string) {
-						const maxScroll = Math.max(0, scriptLines.length - VISIBLE_LINES);
-
-						if (matchesKey(data, Key.escape) || data === "q") {
-							done();
-							return;
-						} else if (data === "c") {
-							// Copy the full install command (creates file + runs install)
-							if (copyToClipboard(installCommand)) {
-								copied = true;
-								tui.requestRender();
-								// Auto-close after a brief delay
-								setTimeout(() => done(), 500);
-							}
-							return;
-						} else if (matchesKey(data, Key.up) || data === "k") {
-							scrollOffset = Math.max(0, scrollOffset - 1);
-							tui.requestRender();
-						} else if (matchesKey(data, Key.down) || data === "j") {
-							scrollOffset = Math.min(maxScroll, scrollOffset + 1);
-							tui.requestRender();
-						} else if (matchesKey(data, Key.pageUp)) {
-							scrollOffset = Math.max(0, scrollOffset - VISIBLE_LINES);
-							tui.requestRender();
-						} else if (matchesKey(data, Key.pageDown)) {
-							scrollOffset = Math.min(maxScroll, scrollOffset + VISIBLE_LINES);
-							tui.requestRender();
-						} else if (matchesKey(data, Key.home)) {
-							scrollOffset = 0;
-							tui.requestRender();
-						} else if (matchesKey(data, Key.end)) {
-							scrollOffset = maxScroll;
-							tui.requestRender();
-						}
-					},
-				};
-			});
-
-			ctx.ui.notify("Paste the copied command on your LOCAL machine terminal to auto-install", "info");
 		},
 	});
 

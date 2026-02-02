@@ -54,10 +54,6 @@ Opens the interactive screenshot picker UI. Browse your recent screenshots with 
 
 Clear all staged screenshots without sending.
 
-### `/ss-ssh-sync`
-
-Show script to run on your local machine for SSH sync mode (see [SSH Sync Mode](#ssh-sync-mode-for-remote-development) below).
-
 ### `Ctrl+Shift+S`
 
 Keyboard shortcut to open the picker (same as `/ss`).
@@ -66,7 +62,6 @@ Keyboard shortcut to open the picker (same as `/ss`).
 
 - **Multiple sources with tabs** - Configure multiple directories/patterns, switch with Ctrl+T
 - **Glob pattern support** - Use patterns like `**/*.png` to match files flexibly
-- **SSH sync mode** - Take screenshots locally, sync them to remote where pi runs
 - **Thumbnail previews** - See what you're selecting (Kitty/iTerm2/Ghostty/WezTerm)
 - **Multi-select** - Stage multiple screenshots, they all attach when you send
 - **Relative timestamps** - "2 minutes ago", "yesterday", etc.
@@ -140,172 +135,60 @@ export PI_SCREENSHOTS_DIR="/path/to/screenshots"
 2. Environment variable (`PI_SCREENSHOTS_DIR`)
 3. Platform default (see above)
 
-## SSH Sync Mode (for Remote Development)
+## Remote Development
 
-When you're developing on a remote machine via SSH but want to share screenshots from your local screen:
+When developing on a remote machine via SSH, you need a way to get screenshots from your local machine to the remote. Use one of these external tools:
 
-```
-[Your local machine] --sync--> [Remote machine running pi]
-     (screenshots)                    (/ss shows them)
-```
+### Option 1: SSHFS (Simplest)
 
-### Setup
+Mount a remote folder locally. Screenshots you take locally appear on the remote instantly.
 
-1. **On the remote machine** (where pi runs via SSH), run:
-   ```
-   /ss-ssh-sync
-   ```
-   Press `c` to copy the install command to clipboard.
-
-2. **On your LOCAL machine** (in a separate terminal, not SSH), paste and run.
-
-3. **Restart pi on the remote** to see synced screenshots:
-   - Exit pi (`Ctrl+C` or `/exit`)
-   - Run `pi` again
-   - Use `/ss` to see your screenshots
-
-That's it! The sync runs as a background service and starts automatically on login.
-
-### Managing the sync service
-
-After installation, use these commands on your **local machine**:
+**On your local machine:**
 
 ```bash
-~/ss-sync.sh status     # Check if sync is running
-~/ss-sync.sh stop       # Stop sync temporarily
-~/ss-sync.sh start      # Start sync again
-~/ss-sync.sh uninstall  # Remove automatic sync completely
-~/ss-sync.sh run        # Run in foreground (for debugging)
+# Install sshfs
+# macOS: brew install macfuse sshfs
+# Linux: sudo apt install sshfs
+
+# Create mount point
+mkdir -p ~/remote-screenshots
+
+# Mount (replace with your remote)
+sshfs user@remote:~/Screenshots ~/remote-screenshots
+
+# Configure macOS to save screenshots there
+defaults write com.apple.screencapture location ~/remote-screenshots
+killall SystemUIServer
 ```
 
-### How it works
-
-The `install` command sets up a background service:
-- **macOS**: LaunchAgent (`~/Library/LaunchAgents/pi-ss-sync-*.plist`)
-- **Linux**: systemd user service (`~/.config/systemd/user/pi-ss-sync-*.service`)
-
-The service:
-1. Starts automatically when you log in
-2. Watches your local screenshot folder using `fswatch`
-3. When a screenshot appears, automatically `scp`s it to the remote
-4. Logs to `~/.pi/ss-sync/*.log`
-
-```
-LOCAL MACHINE                              REMOTE MACHINE
-┌──────────────────────┐                   ┌──────────────────────┐
-│ LaunchAgent/systemd  │                   │ pi running here      │
-│   ↓                  │                   │                      │
-│ watches ~/Desktop    │    scp            │ ~/Screenshots/       │
-│   ↓                  │ ────────────────► │   Screenshot.png     │
-│ new screenshot! ─────│                   │                      │
-│   ↓                  │                   │ /ss shows it! ✓      │
-│ (auto-restarts)      │                   │                      │
-└──────────────────────┘                   └──────────────────────┘
-```
-
-### Configuration
-
-You can customize the paths in `~/.pi/agent/settings.json` on the **remote machine** (where pi runs):
+**On the remote**, configure pi-screenshots to read from `~/Screenshots`:
 
 ```json
 {
   "pi-screenshots": {
-    "sources": ["~/Screenshots"],
-    "sshSync": {
-      "localWatch": "~/Screenshots",
-      "remoteDir": "~/Screenshots",
-      "host": "your-server.com",
-      "port": 22
-    }
+    "sources": ["~/Screenshots"]
   }
 }
 ```
 
-- `localWatch` - Directory to watch on your local machine (default: `~/Screenshots`)
-- `remoteDir` - Directory on remote where screenshots are synced (default: `~/Screenshots`)
-- `host` - Hostname/IP your local machine uses to reach the remote (required for Docker containers or AWS instances where the auto-detected hostname won't resolve)
-- `port` - SSH port (default: `22`, useful for Docker or custom SSH setups)
+### Option 2: Syncthing (Most Robust)
 
-### macOS: Protected Directories (Automatic Symlink)
+[Syncthing](https://syncthing.net/) provides continuous, bidirectional file sync. Better for unreliable connections.
 
-On macOS, **LaunchAgents cannot access `~/Desktop`, `~/Documents`, or `~/Downloads`** without Full Disk Access. The install script **automatically handles this** by creating a symlink:
+1. Install Syncthing on both machines
+2. Share your local screenshot folder with the remote
+3. Configure pi-screenshots to read from the synced folder
 
-```
-~/Desktop/ss (your configured path)
-      ↓ symlink
-~/Screenshots (actual storage, accessible by LaunchAgent)
-```
+### Thumbnail Previews over SSH
 
-**What happens automatically on install:**
-1. Creates `~/Screenshots` directory
-2. Moves existing screenshots from your configured path to `~/Screenshots`
-3. Creates a symlink so macOS still saves to your configured location
-4. LaunchAgent watches `~/Screenshots` (no permission issues)
+To enable thumbnail previews over SSH, add your terminal to the remote's shell profile:
 
-**Example:** If you configure `localWatch: "~/Desktop/ss"`:
-- macOS saves screenshot → `~/Desktop/ss/Screenshot.png`
-- Symlink redirects → `~/Screenshots/Screenshot.png` (actual file)
-- LaunchAgent syncs from `~/Screenshots` ✓
-
-**Alternative approaches:**
-
-1. **Change macOS screenshot location directly:**
-   ```bash
-   defaults write com.apple.screencapture location ~/Screenshots
-   killall SystemUIServer
-   ```
-
-2. **Grant Full Disk Access to `/bin/bash`:**
-   - System Settings → Privacy & Security → Full Disk Access
-   - Click `+`, press `Cmd+Shift+G`, type `/bin/bash`
-   - (Grants access to all bash scripts - less secure)
-
-### Docker / Cloud VM Setup
-
-When the remote is a Docker container or cloud instance, the auto-detected hostname often won't resolve from your local machine. You must specify the `host` explicitly:
-
-**Docker example:**
-```json
-{
-  "pi-screenshots": {
-    "sshSync": {
-      "host": "localhost",
-      "port": 2222
-    }
-  }
-}
+```bash
+# Add to remote ~/.bashrc or ~/.zshrc
+export TERM_PROGRAM=ghostty  # or: kitty, WezTerm, iTerm.app
 ```
 
-**AWS EC2 example:**
-```json
-{
-  "pi-screenshots": {
-    "sshSync": {
-      "host": "ec2-1-2-3-4.compute.amazonaws.com"
-    }
-  }
-}
-```
-
-### Requirements for SSH Sync
-
-- SSH key authentication set up between local and remote
-- `fswatch` on local machine (cross-platform: macOS, Linux, BSD, Windows)
-  - **Auto-installed** by the script if not present
-  - Or install manually:
-    ```bash
-    # macOS
-    brew install fswatch
-    
-    # Linux (Debian/Ubuntu)
-    sudo apt install fswatch
-    
-    # Linux (Fedora)
-    sudo dnf install fswatch
-    
-    # Linux (Arch)
-    sudo pacman -S fswatch
-    ```
+Restart pi after (can't use `!` inside pi).
 
 ## Supported Screenshot Formats
 
@@ -335,18 +218,6 @@ Only PNG files matching these patterns are shown.
 - macOS or Linux
 - Terminal with image support for thumbnails (Kitty, iTerm2, Ghostty, WezTerm)
   - Falls back gracefully on unsupported terminals
-- For SSH sync mode: SSH key auth + fswatch on local machine (auto-installed by script)
-
-### Thumbnail Previews over SSH
-
-To enable thumbnail previews over SSH, add your terminal to the remote's shell profile:
-
-```bash
-# Add to remote ~/.bashrc or ~/.zshrc
-export TERM_PROGRAM=ghostty  # or: kitty, WezTerm, iTerm.app
-```
-
-Restart pi after (can't use `!` inside pi). The install script will show the exact command for your terminal.
 
 ## License
 
