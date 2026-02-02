@@ -17,13 +17,15 @@
  *
  * Usage:
  *   /ss              - Show screenshot selector (stages images)
- *   /ssclear         - Clear staged screenshots
+ *   /ss-clear        - Clear staged screenshots
  *   Ctrl+Shift+S     - Quick access shortcut
+ *   Ctrl+Shift+X     - Clear all staged screenshots
  *
  * Keys:
  *   Up/Down          - Navigate screenshots
  *   Ctrl+T           - Cycle through source tabs
- *   s / space        - Stage current screenshot (can repeat on different items)
+ *   s / space        - Stage/unstage current screenshot
+ *   x                - Clear all staged screenshots
  *   o                - Open in default viewer
  *   d                - Delete screenshot from disk
  *   enter            - Close selector
@@ -354,6 +356,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 	// Staged images waiting to be sent with the next user message
 	let stagedImages: ImageContent[] = [];
+	// Track staged paths at module level so picker can show ✓ on reopening
+	let stagedPaths = new Set<string>();
 
 	/**
 	 * Get source tabs based on configuration.
@@ -457,7 +461,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 		}
 
 		// Track which screenshots have been staged during this session (by path)
-		const alreadyStaged = new Set<string>();
+		// Initialize from module-level stagedPaths so reopening shows previously staged items
+		const alreadyStaged = new Set<string>(stagedPaths);
 
 		const result = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
 			let activeTab = 0;
@@ -482,17 +487,18 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			// Helper to toggle stage/unstage a screenshot
 			function toggleStageScreenshot(screenshot: ScreenshotInfo): void {
 				if (alreadyStaged.has(screenshot.path)) {
-					// Unstage - remove from stagedImages and alreadyStaged
-					const stagedPaths = [...alreadyStaged];
-					const pathIndex = stagedPaths.indexOf(screenshot.path);
+					// Unstage - remove from stagedImages, alreadyStaged, and stagedPaths
+					const pathsArray = [...alreadyStaged];
+					const pathIndex = pathsArray.indexOf(screenshot.path);
 					if (pathIndex !== -1) {
 						stagedImages.splice(pathIndex, 1);
 					}
 					alreadyStaged.delete(screenshot.path);
+					stagedPaths.delete(screenshot.path);
 					return;
 				}
 
-				// Stage - add to stagedImages
+				// Stage - add to stagedImages and track path
 				try {
 					const img = loadImageBase64(screenshot.path);
 					stagedImages.push({
@@ -501,9 +507,17 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						data: img.data,
 					});
 					alreadyStaged.add(screenshot.path);
+					stagedPaths.add(screenshot.path);
 				} catch {
 					// Silently fail for individual staging
 				}
+			}
+
+			// Helper to clear all staged screenshots
+			function clearAllStaged(): void {
+				stagedImages = [];
+				alreadyStaged.clear();
+				stagedPaths.clear();
 			}
 
 			// Typical terminal cell dimensions (pixels)
@@ -692,7 +706,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						lines.push(" " + theme.fg("dim", "\u2191\u2193 nav \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"));
 					} else {
 						lines.push(" " + theme.fg("success", `\u2713 ${stagedCount} staged`));
-						lines.push(" " + theme.fg("dim", "s/space toggle \u2022 d delete \u2022 nn nuke \u2022 enter done"));
+						lines.push(" " + theme.fg("dim", "s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"));
 					}
 					lines.push(border);
 
@@ -721,12 +735,13 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 									unlinkSync(screenshot.path);
 									thumbnails.delete(screenshot.path);
 									if (alreadyStaged.has(screenshot.path)) {
-										const stagedPaths = [...alreadyStaged];
-										const pathIndex = stagedPaths.indexOf(screenshot.path);
+										const pathsArray = [...alreadyStaged];
+										const pathIndex = pathsArray.indexOf(screenshot.path);
 										if (pathIndex !== -1) {
 											stagedImages.splice(pathIndex, 1);
 										}
 										alreadyStaged.delete(screenshot.path);
+										stagedPaths.delete(screenshot.path);
 									}
 								} catch {
 									// Silently fail for individual files
@@ -808,6 +823,12 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						if (screenshots[cursor]) {
 							openFile(screenshots[cursor].path);
 						}
+					} else if (data === "x" || data === "X") {
+						// Clear all staged screenshots
+						if (alreadyStaged.size > 0) {
+							clearAllStaged();
+							tui.requestRender();
+						}
 					} else if (data === "d" || data === "D") {
 						// Delete the screenshot file from disk
 						if (screenshots.length === 0) return;
@@ -821,12 +842,13 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 							// Remove from alreadyStaged if it was staged
 							if (alreadyStaged.has(screenshot.path)) {
-								const stagedPaths = [...alreadyStaged];
-								const pathIndex = stagedPaths.indexOf(screenshot.path);
+								const pathsArray = [...alreadyStaged];
+								const pathIndex = pathsArray.indexOf(screenshot.path);
 								if (pathIndex !== -1) {
 									stagedImages.splice(pathIndex, 1);
 								}
 								alreadyStaged.delete(screenshot.path);
+								stagedPaths.delete(screenshot.path);
 							}
 
 							// Remove from current tab's screenshots
@@ -893,7 +915,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			const label = stagedImages.length === 1 ? "screenshot" : "screenshots";
 			ctx.ui.setWidget(
 				"screenshots-staged",
-				[`\uD83D\uDCF7 ${stagedImages.length} ${label} staged (/ssclear to remove)`],
+				[`\uD83D\uDCF7 ${stagedImages.length} ${label} staged (Ctrl+Shift+X to clear)`],
 				{ placement: "belowEditor" }
 			);
 		} else {
@@ -911,11 +933,12 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 	});
 
 	// Register command to clear staged screenshots
-	pi.registerCommand("ssclear", {
+	pi.registerCommand("ss-clear", {
 		description: "Clear staged screenshots",
 		handler: async (_args, ctx) => {
 			const count = stagedImages.length;
 			stagedImages = [];
+			stagedPaths.clear();
 			updateStagedWidget(ctx);
 			if (count > 0) {
 				ctx.ui.notify(`Cleared ${count} staged screenshot${count === 1 ? "" : "s"}`, "info");
@@ -931,6 +954,20 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 		handler: async (ctx) => {
 			await showScreenshotSelector(ctx);
 			updateStagedWidget(ctx);
+		},
+	});
+
+	// Register shortcut to clear staged screenshots
+	pi.registerShortcut(Key.ctrlShift("x"), {
+		description: "Clear staged screenshots",
+		handler: async (ctx) => {
+			const count = stagedImages.length;
+			stagedImages = [];
+			stagedPaths.clear();
+			updateStagedWidget(ctx);
+			if (count > 0) {
+				ctx.ui.notify(`Cleared ${count} staged screenshot${count === 1 ? "" : "s"}`, "info");
+			}
 		},
 	});
 }

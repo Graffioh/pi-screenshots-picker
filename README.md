@@ -44,19 +44,24 @@ Opens the interactive screenshot picker UI. Browse your recent screenshots with 
 **Keys:**
 - **↑↓** - Navigate through screenshots
 - **Ctrl+T** - Cycle through source tabs (when multiple sources configured)
-- **s / space** - Stage current screenshot (✓ indicator appears)
+- **s / space** - Stage/unstage current screenshot (✓ indicator appears)
+- **x** - Clear all staged screenshots
 - **o** - Open in Preview.app
 - **d** - Delete screenshot from disk
 - **Enter** - Close picker
 - **Esc** - Cancel
 
-### `/ssclear`
+### `/ss-clear`
 
 Clear all staged screenshots without sending.
 
 ### `Ctrl+Shift+S`
 
 Keyboard shortcut to open the picker (same as `/ss`).
+
+### `Ctrl+Shift+X`
+
+Keyboard shortcut to clear all staged screenshots (same as `/ss-clear`).
 
 ## Features
 
