@@ -1,6 +1,6 @@
 {
   "name": "pi-screenshots-picker",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "pi": {
     "extensions": ["./index.ts"],
     "video": "https://raw.githubusercontent.com/Graffioh/pi-screenshots-picker/main/demo.mp4"

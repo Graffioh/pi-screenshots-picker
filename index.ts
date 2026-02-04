@@ -389,6 +389,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 		// Attach staged images to the user's message
 		const imagesToAttach = [...stagedImages];
 		stagedImages = []; // Clear staged images
+		stagedPaths.clear(); // Clear staged paths so picker doesn't show old ✓ state
 
 		// Clear the widget
 		ctx.ui.setWidget("screenshots-staged", undefined);
