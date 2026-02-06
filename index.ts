@@ -24,6 +24,7 @@
  * Keys:
  *   Up/Down          - Navigate screenshots
  *   Ctrl+T           - Cycle through source tabs
+ *   z                - Toggle zoomed preview mode
  *   s / space        - Stage/unstage current screenshot
  *   x                - Clear all staged screenshots
  *   o                - Open in default viewer
@@ -470,8 +471,14 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			let cursor = 0;
 			let scrollOffset = 0;
 			const LIST_WIDTH = 45;
-			const VISIBLE_ITEMS = 10;
-			const CONTENT_LINES = 10;
+			const LIST_VISIBLE_ITEMS = 10;
+			const PREVIEW_LINES = 14;
+			const PREVIEW_WIDTH_CAP = 70;
+			const ZOOM_PREVIEW_MIN_LINES = 18;
+			const ZOOM_PREVIEW_MAX_LINES = 28;
+			const ZOOM_PREVIEW_WIDTH_CAP = 120;
+
+			let previewZoom = false;
 
 			// Track double-n for nuke
 			let nukeWarning = false;
@@ -524,23 +531,33 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			// Typical terminal cell dimensions (pixels)
 			const CELL_WIDTH_PX = 9;
 			const CELL_HEIGHT_PX = 18;
-			const MAX_WIDTH_CELLS = 45;
 
 			// Calculate max width cells so that image height fits in maxRows
-			function calculateConstrainedWidth(dims: { width: number; height: number }, maxRows: number): number {
-				const scaledWidthPx = MAX_WIDTH_CELLS * CELL_WIDTH_PX;
+			function calculateConstrainedWidth(
+				dims: { width: number; height: number },
+				maxRows: number,
+				maxWidthCells: number
+			): number {
+				const safeMaxWidthCells = Math.max(1, maxWidthCells);
+				const scaledWidthPx = safeMaxWidthCells * CELL_WIDTH_PX;
 				const scale = scaledWidthPx / dims.width;
 				const scaledHeightPx = dims.height * scale;
 				const rows = Math.ceil(scaledHeightPx / CELL_HEIGHT_PX);
 
 				if (rows <= maxRows) {
-					return MAX_WIDTH_CELLS;
+					return safeMaxWidthCells;
 				}
 
 				const targetHeightPx = maxRows * CELL_HEIGHT_PX;
 				const targetScale = targetHeightPx / dims.height;
 				const targetWidthPx = dims.width * targetScale;
-				return Math.max(1, Math.floor(targetWidthPx / CELL_WIDTH_PX));
+				return Math.max(1, Math.min(safeMaxWidthCells, Math.floor(targetWidthPx / CELL_WIDTH_PX)));
+			}
+
+			function getZoomPreviewLines(): number {
+				const terminalRows = process.stdout.rows || 40;
+				const availableRows = Math.max(PREVIEW_LINES, terminalRows - 14);
+				return Math.max(ZOOM_PREVIEW_MIN_LINES, Math.min(ZOOM_PREVIEW_MAX_LINES, availableRows));
 			}
 
 			function padToWidth(str: string, targetWidth: number): string {
@@ -551,7 +568,11 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 			let lastRenderedPath = "";
 
-			function renderThumbnail(screenshot: ScreenshotInfo): string[] {
+			function renderThumbnail(
+				screenshot: ScreenshotInfo,
+				maxPreviewWidthCells: number,
+				previewLines: number
+			): string[] {
 				const thumb = loadThumbnail(screenshot);
 				const name = screenshot.name.slice(-20);
 
@@ -565,14 +586,16 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				if (!thumb) {
 					const lines: string[] = [];
 					lines.push(deleteCmd + theme.fg("dim", `  [No preview: ${name}]`));
-					for (let i = 1; i < CONTENT_LINES; i++) lines.push("");
+					for (let i = 1; i < previewLines; i++) lines.push("");
 					return lines;
 				}
 
 				try {
 					// Get dimensions and calculate constrained width so height fits
 					const dims = getImageDimensions(thumb.data, thumb.mimeType);
-					const maxWidth = dims ? calculateConstrainedWidth(dims, CONTENT_LINES) : MAX_WIDTH_CELLS;
+					const maxWidth = dims
+						? calculateConstrainedWidth(dims, previewLines, maxPreviewWidthCells)
+						: Math.max(1, maxPreviewWidthCells);
 
 					const img = new Image(thumb.data, thumb.mimeType, imageTheme, {
 						maxWidthCells: maxWidth,
@@ -595,13 +618,13 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 							lines.push(theme.fg("dim", "  Thumbnails require Kitty, iTerm2,"));
 							lines.push(theme.fg("dim", "  WezTerm, or Ghostty terminal"));
 						}
-						for (let i = lines.length; i < CONTENT_LINES; i++) lines.push("");
+						for (let i = lines.length; i < previewLines; i++) lines.push("");
 						return lines;
 					}
 
 					// Image component returns (rows-1) empty lines, then cursor-up + image on last line.
 					const lines: string[] = [];
-					for (let i = 0; i < CONTENT_LINES; i++) {
+					for (let i = 0; i < previewLines; i++) {
 						const line = rendered[i] || "";
 						lines.push(i === 0 ? deleteCmd + line : line);
 					}
@@ -609,7 +632,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				} catch {
 					const lines: string[] = [];
 					lines.push(deleteCmd + theme.fg("error", `  [Error: ${name}]`));
-					for (let i = 1; i < CONTENT_LINES; i++) lines.push("");
+					for (let i = 1; i < previewLines; i++) lines.push("");
 					return lines;
 				}
 			}
@@ -619,6 +642,15 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					const lines: string[] = [];
 					const border = theme.fg("accent", "\u2500".repeat(width));
 					const screenshots = getCurrentScreenshots();
+					const previewLines = previewZoom ? getZoomPreviewLines() : PREVIEW_LINES;
+					const listVisibleItems = previewZoom ? 0 : LIST_VISIBLE_ITEMS;
+					const listWidth = previewZoom ? 0 : LIST_WIDTH;
+					const previewWidthCap = previewZoom ? ZOOM_PREVIEW_WIDTH_CAP : PREVIEW_WIDTH_CAP;
+					const contentRows = Math.max(listVisibleItems, previewLines);
+					const maxPreviewWidthCells = Math.max(
+						1,
+						Math.min(previewWidthCap, width - listWidth - (previewZoom ? 2 : 3))
+					);
 
 					// Header
 					lines.push(border);
@@ -638,62 +670,98 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 							}
 							tabLine += " ";
 						}
-						tabLine += theme.fg("dim", "  Ctrl+T: switch");
-						lines.push(padToWidth(tabLine, LIST_WIDTH) + "\u2502");
-						lines.push(padToWidth("", LIST_WIDTH) + "\u2502");
+						tabLine += theme.fg("dim", previewZoom ? "  Ctrl+T: switch \u2022 z: split" : "  Ctrl+T: switch \u2022 z: zoom");
+						if (previewZoom) {
+							lines.push(tabLine);
+							lines.push("");
+						} else {
+							lines.push(padToWidth(tabLine, LIST_WIDTH) + "\u2502");
+							lines.push(padToWidth("", LIST_WIDTH) + "\u2502");
+						}
 					}
 
-					// Title
-					const countInfo = screenshots.length > VISIBLE_ITEMS ? ` (${cursor + 1}/${screenshots.length})` : "";
-					lines.push(
-						padToWidth(" " + theme.fg("accent", theme.bold("Recent Screenshots")) + theme.fg("dim", countInfo), LIST_WIDTH) +
-							"\u2502"
-					);
+					if (previewZoom) {
+						const countInfo = screenshots.length > 0 ? ` (${cursor + 1}/${screenshots.length})` : "";
+						lines.push(" " + theme.fg("accent", theme.bold("Screenshot Preview")) + theme.fg("dim", countInfo));
 
-					// Source path hint
-					const sourcePath = expandPath(tabs[activeTab].pattern).slice(-40);
-					lines.push(padToWidth(" " + theme.fg("dim", sourcePath), LIST_WIDTH) + "\u2502");
-					lines.push(padToWidth("", LIST_WIDTH) + "\u2502");
+						const sourcePath = expandPath(tabs[activeTab].pattern).slice(-80);
+						lines.push(" " + theme.fg("dim", sourcePath));
 
-					// Render thumbnail for current selection
-					const currentScreenshot = screenshots[cursor];
-					const imageLines = currentScreenshot ? renderThumbnail(currentScreenshot) : Array(CONTENT_LINES).fill("");
-
-					// Content area: fixed CONTENT_LINES rows with scrolling
-					for (let i = 0; i < CONTENT_LINES; i++) {
-						const itemIndex = scrollOffset + i;
-						let listLine = "";
-
-						if (itemIndex < screenshots.length) {
-							const screenshot = screenshots[itemIndex];
-							const isStaged = alreadyStaged.has(screenshot.path);
-							const isCursor = itemIndex === cursor;
-
-							// Show different indicators
-							const checkbox = isStaged ? "\u2713" : "\u25CB";
-							const cursorIndicator = isCursor ? "\u25B8" : " ";
-
-							const relTime = formatRelativeTime(screenshot.mtime);
-							const size = formatSize(screenshot.size);
-							const timeStr = screenshot.mtime.toLocaleTimeString("en-US", {
-								hour: "2-digit",
-								minute: "2-digit",
-							});
-
-							listLine = ` ${cursorIndicator} ${checkbox} ${timeStr} (${relTime}) - ${size}`;
-
-							if (isStaged) {
-								listLine = theme.fg("success", listLine);
-							} else if (isCursor) {
-								listLine = theme.fg("accent", listLine);
-							} else {
-								listLine = theme.fg("text", listLine);
-							}
+						const currentScreenshot = screenshots[cursor];
+						if (currentScreenshot) {
+							const relTime = formatRelativeTime(currentScreenshot.mtime);
+							const size = formatSize(currentScreenshot.size);
+							lines.push(" " + theme.fg("dim", `${currentScreenshot.name} \u2022 ${relTime} \u2022 ${size}`));
+						} else {
+							lines.push(" " + theme.fg("dim", "No screenshot selected"));
 						}
+						lines.push("");
 
-						const paddedLine = padToWidth(listLine, LIST_WIDTH);
-						const imageLine = imageLines[i] || "";
-						lines.push(paddedLine + "\u2502 " + imageLine);
+						const imageLines = currentScreenshot
+							? renderThumbnail(currentScreenshot, maxPreviewWidthCells, previewLines)
+							: Array(previewLines).fill("");
+
+						for (let i = 0; i < contentRows; i++) {
+							const imageLine = imageLines[i] || "";
+							lines.push(" " + imageLine);
+						}
+					} else {
+						// Title
+						const countInfo = screenshots.length > LIST_VISIBLE_ITEMS ? ` (${cursor + 1}/${screenshots.length})` : "";
+						lines.push(
+							padToWidth(" " + theme.fg("accent", theme.bold("Recent Screenshots")) + theme.fg("dim", countInfo), LIST_WIDTH) +
+								"\u2502"
+						);
+
+						// Source path hint
+						const sourcePath = expandPath(tabs[activeTab].pattern).slice(-40);
+						lines.push(padToWidth(" " + theme.fg("dim", sourcePath), LIST_WIDTH) + "\u2502");
+						lines.push(padToWidth("", LIST_WIDTH) + "\u2502");
+
+						// Render thumbnail for current selection
+						const currentScreenshot = screenshots[cursor];
+						const imageLines = currentScreenshot
+							? renderThumbnail(currentScreenshot, maxPreviewWidthCells, previewLines)
+							: Array(previewLines).fill("");
+
+						// Content area: list keeps a compact height while preview gets extra rows
+						for (let i = 0; i < contentRows; i++) {
+							let listLine = "";
+
+							if (i < listVisibleItems) {
+								const itemIndex = scrollOffset + i;
+								if (itemIndex < screenshots.length) {
+									const screenshot = screenshots[itemIndex];
+									const isStaged = alreadyStaged.has(screenshot.path);
+									const isCursor = itemIndex === cursor;
+
+									// Show different indicators
+									const checkbox = isStaged ? "\u2713" : "\u25CB";
+									const cursorIndicator = isCursor ? "\u25B8" : " ";
+
+									const relTime = formatRelativeTime(screenshot.mtime);
+									const size = formatSize(screenshot.size);
+									const timeStr = screenshot.mtime.toLocaleTimeString("en-US", {
+										hour: "2-digit",
+										minute: "2-digit",
+									});
+
+									listLine = ` ${cursorIndicator} ${checkbox} ${timeStr} (${relTime}) - ${size}`;
+
+									if (isStaged) {
+										listLine = theme.fg("success", listLine);
+									} else if (isCursor) {
+										listLine = theme.fg("accent", listLine);
+									} else {
+										listLine = theme.fg("text", listLine);
+									}
+								}
+							}
+
+							const paddedLine = padToWidth(listLine, LIST_WIDTH);
+							const imageLine = imageLines[i] || "";
+							lines.push(paddedLine + "\u2502 " + imageLine);
+						}
 					}
 
 					// Footer
@@ -704,10 +772,26 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						lines.push(" " + theme.fg("dim", "Any other key to cancel"));
 					} else if (stagedCount === 0) {
 						lines.push(" " + theme.fg("warning", "\u26A0 Press s/space to stage screenshots before closing"));
-						lines.push(" " + theme.fg("dim", "\u2191\u2193 nav \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"));
+						lines.push(
+							" " +
+								theme.fg(
+									"dim",
+									previewZoom
+										? "\u2191\u2193 nav \u2022 z split \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"
+										: "\u2191\u2193 nav \u2022 z zoom \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"
+								)
+						);
 					} else {
 						lines.push(" " + theme.fg("success", `\u2713 ${stagedCount} staged`));
-						lines.push(" " + theme.fg("dim", "s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"));
+						lines.push(
+							" " +
+								theme.fg(
+									"dim",
+									previewZoom
+										? "z split \u2022 s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"
+										: "z zoom \u2022 s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"
+								)
+						);
 					}
 					lines.push(border);
 
@@ -794,6 +878,14 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						return;
 					}
 
+					if (data === "z" || data === "Z") {
+						cleanupImage();
+						lastRenderedPath = "";
+						previewZoom = !previewZoom;
+						tui.requestRender();
+						return;
+					}
+
 					if (matchesKey(data, Key.up)) {
 						cursor = Math.max(0, cursor - 1);
 						if (cursor < scrollOffset) {
@@ -802,8 +894,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 						tui.requestRender();
 					} else if (matchesKey(data, Key.down)) {
 						cursor = Math.min(screenshots.length - 1, cursor + 1);
-						if (cursor >= scrollOffset + VISIBLE_ITEMS) {
-							scrollOffset = cursor - VISIBLE_ITEMS + 1;
+						if (cursor >= scrollOffset + LIST_VISIBLE_ITEMS) {
+							scrollOffset = cursor - LIST_VISIBLE_ITEMS + 1;
 						}
 						tui.requestRender();
 					} else if (matchesKey(data, Key.space) || data === "s" || data === "S") {
@@ -876,8 +968,8 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 								if (cursor >= tabScreenshots.length) {
 									cursor = tabScreenshots.length - 1;
 								}
-								if (scrollOffset > 0 && scrollOffset >= tabScreenshots.length - VISIBLE_ITEMS + 1) {
-									scrollOffset = Math.max(0, tabScreenshots.length - VISIBLE_ITEMS);
+								if (scrollOffset > 0 && scrollOffset >= tabScreenshots.length - LIST_VISIBLE_ITEMS + 1) {
+									scrollOffset = Math.max(0, tabScreenshots.length - LIST_VISIBLE_ITEMS);
 								}
 							}
 
