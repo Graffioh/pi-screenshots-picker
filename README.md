@@ -44,7 +44,11 @@ Opens the interactive screenshot picker UI. Browse your recent screenshots with 
 **Keys:**
 - **↑↓** - Navigate through screenshots
 - **Ctrl+T** - Cycle through source tabs (when multiple sources configured)
-- **z** - Toggle zoomed preview mode (larger thumbnail area)
+- **z** - Toggle zoom inspector mode
+- **+ / -** - Zoom in/out (inspector mode)
+- **←↑→↓** - Pan image in inspector mode (Kitty/Ghostty/WezTerm); falls back to nav otherwise
+- **[ / ]** - Previous/next screenshot in inspector mode
+- **0** - Reset inspector zoom + pan (only after this you can select other screenshots)
 - **s / space** - Stage/unstage current screenshot (✓ indicator appears)
 - **x** - Clear all staged screenshots
 - **o** - Open in Preview.app
@@ -69,7 +73,7 @@ Keyboard shortcut to clear all staged screenshots (same as `/ss-clear`).
 - **Multiple sources with tabs** - Configure multiple directories/patterns, switch with Ctrl+T
 - **Glob pattern support** - Use patterns like `**/*.png` to match files flexibly
 - **Thumbnail previews** - See what you're selecting (Kitty/iTerm2/Ghostty/WezTerm)
-- **Zoomed preview mode** - Press `z` for a larger, preview-focused layout
+- **Zoom inspector mode** - Press `z`, then pan with arrows and zoom with +/-
 - **Multi-select** - Stage multiple screenshots, they all attach when you send
 - **Relative timestamps** - "2 minutes ago", "yesterday", etc.
 - **File sizes** - Know what you're attaching

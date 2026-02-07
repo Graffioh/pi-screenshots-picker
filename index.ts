@@ -24,7 +24,11 @@
  * Keys:
  *   Up/Down          - Navigate screenshots
  *   Ctrl+T           - Cycle through source tabs
- *   z                - Toggle zoomed preview mode
+ *   z                - Toggle zoomed inspector mode
+ *   +/-              - Zoom in/out in inspector mode
+ *   Arrow keys       - Pan image in inspector mode (or navigate if not zoomed)
+ *   [ / ]            - Previous/next screenshot in inspector mode
+ *   0                - Reset inspector zoom + pan
  *   s / space        - Stage/unstage current screenshot
  *   x                - Clear all staged screenshots
  *   o                - Open in default viewer
@@ -69,10 +73,19 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ImageContent } from "@mariozechner/pi-coding-agent";
-import { Image, Key, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
+import {
+	Image,
+	Key,
+	deleteKittyImage,
+	getCapabilities,
+	getImageDimensions as getTerminalImageDimensions,
+	matchesKey,
+	visibleWidth,
+} from "@mariozechner/pi-tui";
 import { globSync } from "glob";
 
 interface ScreenshotInfo {
@@ -352,6 +365,19 @@ function loadImageBase64(path: string): { data: string; mimeType: string } {
 	};
 }
 
+async function loadImageBase64Async(path: string): Promise<{ data: string; mimeType: string }> {
+	const buffer = await readFile(path);
+	const ext = path.toLowerCase();
+	let mimeType = "image/png";
+	if (ext.endsWith(".jpg") || ext.endsWith(".jpeg")) mimeType = "image/jpeg";
+	else if (ext.endsWith(".webp")) mimeType = "image/webp";
+
+	return {
+		data: buffer.toString("base64"),
+		mimeType,
+	};
+}
+
 export default function screenshotsExtension(pi: ExtensionAPI) {
 	const config = loadConfig();
 
@@ -402,22 +428,10 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	// Helper to get PNG/JPEG dimensions
+	// Helper to get image dimensions (for PNG/JPEG/WebP/GIF when available)
 	function getImageDimensions(base64Data: string, mimeType: string): { width: number; height: number } | null {
-		try {
-			const buffer = Buffer.from(base64Data, "base64");
-
-			if (mimeType === "image/png") {
-				if (buffer.length < 24) return null;
-				if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) return null;
-				return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
-			}
-
-			// For JPEG/WebP, just return null and let the image component handle it
-			return null;
-		} catch {
-			return null;
-		}
+		const dims = getTerminalImageDimensions(base64Data, mimeType);
+		return dims ? { width: dims.widthPx, height: dims.heightPx } : null;
 	}
 
 	/**
@@ -442,7 +456,42 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 		// Lazy-load thumbnails (load on demand, skip files > 5MB)
 		const MAX_THUMB_SIZE = 5 * 1024 * 1024; // 5MB
+		const SYNC_THUMB_SIZE = 300 * 1024; // Keep small previews snappy
 		const thumbnails: Map<string, { data: string; mimeType: string } | null> = new Map();
+		const thumbnailLoads: Map<string, Promise<void>> = new Map();
+		const imageDimensionsCache: Map<string, { width: number; height: number } | null> = new Map();
+		let requestPreviewRender: (() => void) | null = null;
+
+		function isThumbnailLoading(path: string): boolean {
+			return thumbnailLoads.has(path);
+		}
+
+		function startThumbnailLoad(screenshot: ScreenshotInfo): void {
+			if (thumbnails.has(screenshot.path) || thumbnailLoads.has(screenshot.path)) {
+				return;
+			}
+
+			if (screenshot.size > MAX_THUMB_SIZE) {
+				thumbnails.set(screenshot.path, null);
+				return;
+			}
+
+			const loadPromise = loadImageBase64Async(screenshot.path)
+				.then((img) => {
+					thumbnails.set(screenshot.path, img);
+					imageDimensionsCache.delete(screenshot.path);
+				})
+				.catch(() => {
+					thumbnails.set(screenshot.path, null);
+					imageDimensionsCache.delete(screenshot.path);
+				})
+				.finally(() => {
+					thumbnailLoads.delete(screenshot.path);
+					requestPreviewRender?.();
+				});
+
+			thumbnailLoads.set(screenshot.path, loadPromise);
+		}
 
 		function loadThumbnail(screenshot: ScreenshotInfo): { data: string; mimeType: string } | null {
 			if (thumbnails.has(screenshot.path)) {
@@ -452,21 +501,57 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				thumbnails.set(screenshot.path, null);
 				return null;
 			}
-			try {
-				const img = loadImageBase64(screenshot.path);
-				thumbnails.set(screenshot.path, img);
-				return img;
-			} catch {
-				thumbnails.set(screenshot.path, null);
+
+			// Small files are loaded synchronously for immediate preview.
+			if (screenshot.size <= SYNC_THUMB_SIZE) {
+				try {
+					const img = loadImageBase64(screenshot.path);
+					thumbnails.set(screenshot.path, img);
+					return img;
+				} catch {
+					thumbnails.set(screenshot.path, null);
+					return null;
+				}
+			}
+
+			// Larger files are loaded asynchronously to avoid UI stalls.
+			startThumbnailLoad(screenshot);
+
+			if (thumbnails.has(screenshot.path)) {
+				return thumbnails.get(screenshot.path) || null;
+			}
+
+			return null;
+		}
+
+		function getScreenshotDimensions(screenshot: ScreenshotInfo): { width: number; height: number } | null {
+			if (imageDimensionsCache.has(screenshot.path)) {
+				return imageDimensionsCache.get(screenshot.path) || null;
+			}
+
+			const thumb = loadThumbnail(screenshot);
+			if (!thumb) {
+				// Cache null only when loading finished and no preview is available.
+				if (thumbnails.has(screenshot.path) && !isThumbnailLoading(screenshot.path)) {
+					imageDimensionsCache.set(screenshot.path, null);
+				}
 				return null;
 			}
+
+			const dims = getImageDimensions(thumb.data, thumb.mimeType);
+			imageDimensionsCache.set(screenshot.path, dims);
+			return dims;
 		}
 
 		// Track which screenshots have been staged during this session (by path)
 		// Initialize from module-level stagedPaths so reopening shows previously staged items
 		const alreadyStaged = new Set<string>(stagedPaths);
 
-		const result = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+		let result: string[] | null;
+		try {
+			result = await ctx.ui.custom<string[] | null>((tui, theme, _kb, done) => {
+				requestPreviewRender = () => tui.requestRender();
+
 			let activeTab = 0;
 			let cursor = 0;
 			let scrollOffset = 0;
@@ -477,8 +562,19 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			const ZOOM_PREVIEW_MIN_LINES = 18;
 			const ZOOM_PREVIEW_MAX_LINES = 28;
 			const ZOOM_PREVIEW_WIDTH_CAP = 120;
+			const ZOOM_LEVEL_MIN = 1;
+			const ZOOM_LEVEL_MAX = 6;
+			const ZOOM_LEVEL_STEP = 0.25;
+			const ZOOM_PAN_STEP_RATIO = 0.12;
+			const KITTY_IMAGE_ID = 9000;
+			const terminalCapabilities = getCapabilities();
+			const supportsKittyInspector = terminalCapabilities.images === "kitty";
 
 			let previewZoom = false;
+			let zoomLevel = 1;
+			let panX = 0;
+			let panY = 0;
+			let lastRenderWidth = process.stdout.columns || 120;
 
 			// Track double-n for nuke
 			let nukeWarning = false;
@@ -490,6 +586,57 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			// Get current tab's screenshots
 			function getCurrentScreenshots(): ScreenshotInfo[] {
 				return tabs[activeTab]?.screenshots || [];
+			}
+
+			function warmThumbnailsAroundCursor(distance = 5): void {
+				const screenshots = getCurrentScreenshots();
+				if (screenshots.length === 0) {
+					return;
+				}
+
+				const start = Math.max(0, cursor - distance);
+				const end = Math.min(screenshots.length - 1, cursor + distance);
+
+				for (let i = start; i <= end; i++) {
+					const screenshot = screenshots[i];
+					if (!screenshot) continue;
+					loadThumbnail(screenshot);
+				}
+			}
+
+			function clamp(value: number, min: number, max: number): number {
+				if (value < min) return min;
+				if (value > max) return max;
+				return value;
+			}
+
+			function resetZoomViewport(): void {
+				zoomLevel = 1;
+				panX = 0;
+				panY = 0;
+			}
+
+			function moveCursor(delta: number): boolean {
+				const screenshots = getCurrentScreenshots();
+				if (screenshots.length === 0) {
+					return false;
+				}
+
+				const nextCursor = clamp(cursor + delta, 0, screenshots.length - 1);
+				if (nextCursor === cursor) {
+					return false;
+				}
+
+				cursor = nextCursor;
+				if (cursor < scrollOffset) {
+					scrollOffset = cursor;
+				}
+				if (cursor >= scrollOffset + LIST_VISIBLE_ITEMS) {
+					scrollOffset = cursor - LIST_VISIBLE_ITEMS + 1;
+				}
+
+				resetZoomViewport();
+				return true;
 			}
 
 			// Helper to toggle stage/unstage a screenshot
@@ -560,13 +707,183 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				return Math.max(ZOOM_PREVIEW_MIN_LINES, Math.min(ZOOM_PREVIEW_MAX_LINES, availableRows));
 			}
 
+			function getMaxPreviewWidthCells(width: number, isZoomMode: boolean): number {
+				const listWidth = isZoomMode ? 0 : LIST_WIDTH;
+				const previewWidthCap = isZoomMode ? ZOOM_PREVIEW_WIDTH_CAP : PREVIEW_WIDTH_CAP;
+				return Math.max(1, Math.min(previewWidthCap, width - listWidth - (isZoomMode ? 2 : 3)));
+			}
+
 			function padToWidth(str: string, targetWidth: number): string {
 				const currentWidth = visibleWidth(str);
 				if (currentWidth >= targetWidth) return str;
 				return str + " ".repeat(targetWidth - currentWidth);
 			}
 
+			interface ZoomViewportGeometry {
+				cropX: number;
+				cropY: number;
+				cropWidth: number;
+				cropHeight: number;
+				maxPanX: number;
+				maxPanY: number;
+				renderWidthCells: number;
+				renderRows: number;
+			}
+
+			function encodeKittyWithCrop(
+				base64Data: string,
+				options: {
+					columns: number;
+					rows: number;
+					imageId: number;
+					cropX: number;
+					cropY: number;
+					cropWidth: number;
+					cropHeight: number;
+				}
+			): string {
+				const CHUNK_SIZE = 4096;
+				const params = [
+					"a=T",
+					"f=100",
+					"q=2",
+					`c=${Math.max(1, Math.floor(options.columns))}`,
+					`r=${Math.max(1, Math.floor(options.rows))}`,
+					`i=${options.imageId}`,
+					`x=${Math.max(0, Math.floor(options.cropX))}`,
+					`y=${Math.max(0, Math.floor(options.cropY))}`,
+					`w=${Math.max(1, Math.floor(options.cropWidth))}`,
+					`h=${Math.max(1, Math.floor(options.cropHeight))}`,
+				];
+
+				if (base64Data.length <= CHUNK_SIZE) {
+					return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
+				}
+
+				const chunks: string[] = [];
+				let offset = 0;
+				let firstChunk = true;
+
+				while (offset < base64Data.length) {
+					const chunk = base64Data.slice(offset, offset + CHUNK_SIZE);
+					const isLast = offset + CHUNK_SIZE >= base64Data.length;
+
+					if (firstChunk) {
+						chunks.push(`\x1b_G${params.join(",")},m=1;${chunk}\x1b\\`);
+						firstChunk = false;
+					} else if (isLast) {
+						chunks.push(`\x1b_Gm=0;${chunk}\x1b\\`);
+					} else {
+						chunks.push(`\x1b_Gm=1;${chunk}\x1b\\`);
+					}
+
+					offset += CHUNK_SIZE;
+				}
+
+				return chunks.join("");
+			}
+
+			function getZoomViewportGeometry(
+				screenshot: ScreenshotInfo,
+				maxPreviewWidthCells: number,
+				previewLines: number
+			): ZoomViewportGeometry | null {
+				const dims = getScreenshotDimensions(screenshot);
+				if (!dims) {
+					return null;
+				}
+
+				const viewportWidthPx = Math.max(1, maxPreviewWidthCells * CELL_WIDTH_PX);
+				const viewportHeightPx = Math.max(1, previewLines * CELL_HEIGHT_PX);
+				const fitScale = Math.min(viewportWidthPx / dims.width, viewportHeightPx / dims.height);
+				const safeFitScale = fitScale > 0 && Number.isFinite(fitScale) ? fitScale : 1;
+				const scale = safeFitScale * zoomLevel;
+
+				const cropWidth = Math.max(1, Math.min(dims.width, Math.floor(viewportWidthPx / scale)));
+				const cropHeight = Math.max(1, Math.min(dims.height, Math.floor(viewportHeightPx / scale)));
+				const maxPanX = Math.max(0, dims.width - cropWidth);
+				const maxPanY = Math.max(0, dims.height - cropHeight);
+
+				panX = clamp(panX, 0, maxPanX);
+				panY = clamp(panY, 0, maxPanY);
+
+				const renderWidthPx = cropWidth * scale;
+				const renderHeightPx = cropHeight * scale;
+				const renderWidthCells = Math.max(1, Math.min(maxPreviewWidthCells, Math.floor(renderWidthPx / CELL_WIDTH_PX)));
+				const renderRows = Math.max(1, Math.min(previewLines, Math.ceil(renderHeightPx / CELL_HEIGHT_PX)));
+
+				return {
+					cropX: Math.round(panX),
+					cropY: Math.round(panY),
+					cropWidth,
+					cropHeight,
+					maxPanX,
+					maxPanY,
+					renderWidthCells,
+					renderRows,
+				};
+			}
+
+			function panViewport(horizontal: number, vertical: number): boolean {
+				if (!previewZoom || !supportsKittyInspector) {
+					return false;
+				}
+
+				const screenshots = getCurrentScreenshots();
+				const currentScreenshot = screenshots[cursor];
+				if (!currentScreenshot) {
+					return false;
+				}
+
+				const previewLines = getZoomPreviewLines();
+				const maxPreviewWidthCells = getMaxPreviewWidthCells(lastRenderWidth, true);
+				const geometry = getZoomViewportGeometry(currentScreenshot, maxPreviewWidthCells, previewLines);
+				if (!geometry) {
+					return false;
+				}
+
+				const stepX = Math.max(12, Math.floor(geometry.cropWidth * ZOOM_PAN_STEP_RATIO));
+				const stepY = Math.max(12, Math.floor(geometry.cropHeight * ZOOM_PAN_STEP_RATIO));
+
+				const nextPanX = clamp(panX + horizontal * stepX, 0, geometry.maxPanX);
+				const nextPanY = clamp(panY + vertical * stepY, 0, geometry.maxPanY);
+
+				if (nextPanX === panX && nextPanY === panY) {
+					return false;
+				}
+
+				panX = nextPanX;
+				panY = nextPanY;
+				return true;
+			}
+
+			function setZoomLevel(nextZoomLevel: number): boolean {
+				const clampedZoom = clamp(nextZoomLevel, ZOOM_LEVEL_MIN, ZOOM_LEVEL_MAX);
+				if (clampedZoom === zoomLevel) {
+					return false;
+				}
+
+				zoomLevel = clampedZoom;
+				const currentScreenshot = getCurrentScreenshots()[cursor];
+				if (!currentScreenshot) {
+					panX = 0;
+					panY = 0;
+					return true;
+				}
+
+				const previewLines = getZoomPreviewLines();
+				const maxPreviewWidthCells = getMaxPreviewWidthCells(lastRenderWidth, true);
+				const geometry = getZoomViewportGeometry(currentScreenshot, maxPreviewWidthCells, previewLines);
+				if (!geometry) {
+					panX = 0;
+					panY = 0;
+				}
+
+				return true;
+			}
+
 			let lastRenderedPath = "";
+			let lastRenderedFrameKey = "";
 
 			function renderThumbnail(
 				screenshot: ScreenshotInfo,
@@ -575,31 +892,35 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 			): string[] {
 				const thumb = loadThumbnail(screenshot);
 				const name = screenshot.name.slice(-20);
+				const frameKey = `${screenshot.path}:${maxPreviewWidthCells}:${previewLines}`;
 
-				// Delete previous image by ID when switching
+				// Delete previous image when switching to a different screenshot.
+				// Inspector mode has its own renderer that deletes every frame.
 				let deleteCmd = "";
-				if (lastRenderedPath && lastRenderedPath !== screenshot.path) {
-					deleteCmd = `\x1b_Ga=d,d=I,i=9000\x1b\\`;
+				if (lastRenderedFrameKey && lastRenderedFrameKey !== frameKey) {
+					deleteCmd = deleteKittyImage(KITTY_IMAGE_ID);
 				}
 				lastRenderedPath = screenshot.path;
+				lastRenderedFrameKey = frameKey;
 
 				if (!thumb) {
 					const lines: string[] = [];
-					lines.push(deleteCmd + theme.fg("dim", `  [No preview: ${name}]`));
+					const loading = isThumbnailLoading(screenshot.path);
+					lines.push(deleteCmd + theme.fg("dim", loading ? `  [Loading preview: ${name}]` : `  [No preview: ${name}]`));
 					for (let i = 1; i < previewLines; i++) lines.push("");
 					return lines;
 				}
 
 				try {
 					// Get dimensions and calculate constrained width so height fits
-					const dims = getImageDimensions(thumb.data, thumb.mimeType);
+					const dims = getScreenshotDimensions(screenshot);
 					const maxWidth = dims
 						? calculateConstrainedWidth(dims, previewLines, maxPreviewWidthCells)
 						: Math.max(1, maxPreviewWidthCells);
 
 					const img = new Image(thumb.data, thumb.mimeType, imageTheme, {
 						maxWidthCells: maxWidth,
-						imageId: 9000,
+						imageId: KITTY_IMAGE_ID,
 					});
 					const rendered = img.render(maxWidth + 2);
 
@@ -637,20 +958,88 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 				}
 			}
 
+			function renderZoomInspectorThumbnail(
+				screenshot: ScreenshotInfo,
+				maxPreviewWidthCells: number,
+				previewLines: number
+			): { lines: string[]; geometry: ZoomViewportGeometry | null } {
+				if (!supportsKittyInspector) {
+					const zoomedWidth = Math.max(1, Math.min(ZOOM_PREVIEW_WIDTH_CAP, Math.floor(maxPreviewWidthCells * zoomLevel)));
+					return {
+						lines: renderThumbnail(screenshot, zoomedWidth, previewLines),
+						geometry: null,
+					};
+				}
+
+				const thumb = loadThumbnail(screenshot);
+				const name = screenshot.name.slice(-20);
+
+				let deleteCmd = "";
+				// In inspector mode, delete the previous Kitty image on every render.
+				// Otherwise zoom/pan updates of the same screenshot can stack images.
+				if (lastRenderedPath) {
+					deleteCmd = deleteKittyImage(KITTY_IMAGE_ID);
+				}
+				lastRenderedPath = screenshot.path;
+				lastRenderedFrameKey = `${screenshot.path}:${maxPreviewWidthCells}:${previewLines}:zoom`;
+
+				if (!thumb) {
+					const lines: string[] = [];
+					const loading = isThumbnailLoading(screenshot.path);
+					lines.push(deleteCmd + theme.fg("dim", loading ? `  [Loading preview: ${name}]` : `  [No preview: ${name}]`));
+					for (let i = 1; i < previewLines; i++) lines.push("");
+					return { lines, geometry: null };
+				}
+
+				const geometry = getZoomViewportGeometry(screenshot, maxPreviewWidthCells, previewLines);
+				if (!geometry) {
+					const lines: string[] = [];
+					lines.push(deleteCmd + theme.fg("dim", `  [No inspect preview: ${name}]`));
+					for (let i = 1; i < previewLines; i++) lines.push("");
+					return { lines, geometry: null };
+				}
+
+				try {
+					const sequence = encodeKittyWithCrop(thumb.data, {
+						columns: geometry.renderWidthCells,
+						rows: geometry.renderRows,
+						imageId: KITTY_IMAGE_ID,
+						cropX: geometry.cropX,
+						cropY: geometry.cropY,
+						cropWidth: geometry.cropWidth,
+						cropHeight: geometry.cropHeight,
+					});
+
+					const lines: string[] = [];
+					const moveUp = geometry.renderRows > 1 ? `\x1b[${geometry.renderRows - 1}A` : "";
+					for (let i = 0; i < geometry.renderRows - 1; i++) {
+						lines.push("");
+					}
+					lines.push(deleteCmd + moveUp + sequence);
+					for (let i = geometry.renderRows; i < previewLines; i++) {
+						lines.push("");
+					}
+
+					return { lines, geometry };
+				} catch {
+					const lines: string[] = [];
+					lines.push(deleteCmd + theme.fg("error", `  [Inspect error: ${name}]`));
+					for (let i = 1; i < previewLines; i++) lines.push("");
+					return { lines, geometry: null };
+				}
+			}
+
 			return {
 				render(width: number) {
+					lastRenderWidth = width;
 					const lines: string[] = [];
 					const border = theme.fg("accent", "\u2500".repeat(width));
 					const screenshots = getCurrentScreenshots();
+					warmThumbnailsAroundCursor();
 					const previewLines = previewZoom ? getZoomPreviewLines() : PREVIEW_LINES;
 					const listVisibleItems = previewZoom ? 0 : LIST_VISIBLE_ITEMS;
-					const listWidth = previewZoom ? 0 : LIST_WIDTH;
-					const previewWidthCap = previewZoom ? ZOOM_PREVIEW_WIDTH_CAP : PREVIEW_WIDTH_CAP;
 					const contentRows = Math.max(listVisibleItems, previewLines);
-					const maxPreviewWidthCells = Math.max(
-						1,
-						Math.min(previewWidthCap, width - listWidth - (previewZoom ? 2 : 3))
-					);
+					const maxPreviewWidthCells = getMaxPreviewWidthCells(width, previewZoom);
 
 					// Header
 					lines.push(border);
@@ -682,24 +1071,38 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 					if (previewZoom) {
 						const countInfo = screenshots.length > 0 ? ` (${cursor + 1}/${screenshots.length})` : "";
-						lines.push(" " + theme.fg("accent", theme.bold("Screenshot Preview")) + theme.fg("dim", countInfo));
+						lines.push(" " + theme.fg("accent", theme.bold("Screenshot Inspector")) + theme.fg("dim", countInfo));
 
 						const sourcePath = expandPath(tabs[activeTab].pattern).slice(-80);
 						lines.push(" " + theme.fg("dim", sourcePath));
 
 						const currentScreenshot = screenshots[cursor];
+						const zoomRender = currentScreenshot
+							? renderZoomInspectorThumbnail(currentScreenshot, maxPreviewWidthCells, previewLines)
+							: { lines: Array(previewLines).fill(""), geometry: null as ZoomViewportGeometry | null };
+
 						if (currentScreenshot) {
 							const relTime = formatRelativeTime(currentScreenshot.mtime);
 							const size = formatSize(currentScreenshot.size);
-							lines.push(" " + theme.fg("dim", `${currentScreenshot.name} \u2022 ${relTime} \u2022 ${size}`));
+							const panInfo = zoomRender.geometry
+								? ` \u2022 pan ${Math.round(panX)}/${zoomRender.geometry.maxPanX}, ${Math.round(panY)}/${zoomRender.geometry.maxPanY}`
+								: "";
+							lines.push(
+								" " +
+									theme.fg(
+										"dim",
+										`${currentScreenshot.name} \u2022 ${relTime} \u2022 ${size} \u2022 zoom ${zoomLevel.toFixed(2)}x${panInfo}`
+									)
+							);
+							if (!supportsKittyInspector) {
+								lines.push(" " + theme.fg("dim", "Pan inspection works in Kitty/Ghostty/WezTerm terminals"));
+							}
 						} else {
 							lines.push(" " + theme.fg("dim", "No screenshot selected"));
 						}
 						lines.push("");
 
-						const imageLines = currentScreenshot
-							? renderThumbnail(currentScreenshot, maxPreviewWidthCells, previewLines)
-							: Array(previewLines).fill("");
+						const imageLines = zoomRender.lines;
 
 						for (let i = 0; i < contentRows; i++) {
 							const imageLine = imageLines[i] || "";
@@ -766,29 +1169,40 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 					// Footer
 					const stagedCount = alreadyStaged.size;
+					const zoomSelectionLocked = previewZoom && supportsKittyInspector && zoomLevel > ZOOM_LEVEL_MIN;
 					lines.push("");
 					if (nukeWarning) {
 						lines.push(" " + theme.fg("error", "\u26A0 Press n again to DELETE ALL screenshots in this source!"));
 						lines.push(" " + theme.fg("dim", "Any other key to cancel"));
 					} else if (stagedCount === 0) {
 						lines.push(" " + theme.fg("warning", "\u26A0 Press s/space to stage screenshots before closing"));
+						if (zoomSelectionLocked) {
+							lines.push(" " + theme.fg("warning", "Zoom lock: press 0 to reset before using \u2191\u2193 to select other screenshots"));
+						}
 						lines.push(
 							" " +
 								theme.fg(
 									"dim",
 									previewZoom
-										? "\u2191\u2193 nav \u2022 z split \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"
+										? supportsKittyInspector
+											? "\u2191\u2193\u2190\u2192 pan \u2022 +/- zoom \u2022 [ ] nav \u2022 0 reset \u2022 z split \u2022 s/space toggle \u2022 enter done"
+											: "\u2191\u2193 nav \u2022 +/- zoom \u2022 z split \u2022 s/space toggle \u2022 enter done"
 										: "\u2191\u2193 nav \u2022 z zoom \u2022 s/space toggle \u2022 o open \u2022 d delete \u2022 nn nuke \u2022 enter done"
 								)
 						);
 					} else {
 						lines.push(" " + theme.fg("success", `\u2713 ${stagedCount} staged`));
+						if (zoomSelectionLocked) {
+							lines.push(" " + theme.fg("warning", "Zoom lock: press 0 to reset before using \u2191\u2193 to select other screenshots"));
+						}
 						lines.push(
 							" " +
 								theme.fg(
 									"dim",
 									previewZoom
-										? "z split \u2022 s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"
+										? supportsKittyInspector
+											? "\u2191\u2193\u2190\u2192 pan \u2022 +/- zoom \u2022 [ ] nav \u2022 0 reset \u2022 z split \u2022 x clear all \u2022 enter done"
+											: "\u2191\u2193 nav \u2022 +/- zoom \u2022 z split \u2022 x clear all \u2022 enter done"
 										: "z zoom \u2022 s/space toggle \u2022 x clear all \u2022 d delete \u2022 nn nuke \u2022 enter done"
 								)
 						);
@@ -806,7 +1220,9 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					// Helper to clean up displayed image before exiting
 					function cleanupImage() {
 						if (lastRenderedPath) {
-							process.stdout.write(`\x1b_Ga=d,d=I,i=9000\x1b\\`);
+							process.stdout.write(deleteKittyImage(KITTY_IMAGE_ID));
+							lastRenderedPath = "";
+							lastRenderedFrameKey = "";
 						}
 					}
 
@@ -819,6 +1235,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 								try {
 									unlinkSync(screenshot.path);
 									thumbnails.delete(screenshot.path);
+									imageDimensionsCache.delete(screenshot.path);
 									if (alreadyStaged.has(screenshot.path)) {
 										const pathsArray = [...alreadyStaged];
 										const pathIndex = pathsArray.indexOf(screenshot.path);
@@ -840,6 +1257,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 								activeTab = nonEmptyTabIndex;
 								cursor = 0;
 								scrollOffset = 0;
+								resetZoomViewport();
 							} else {
 								cleanupImage();
 								done(null); // No more screenshots anywhere
@@ -847,9 +1265,9 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 							}
 
 							nukeWarning = false;
-							lastRenderedPath = "";
 							cursor = 0;
 							scrollOffset = 0;
+							resetZoomViewport();
 							tui.requestRender();
 						} else {
 							// Any other key cancels nuke
@@ -865,7 +1283,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 							activeTab = (activeTab + 1) % tabs.length;
 							cursor = 0;
 							scrollOffset = 0;
-							lastRenderedPath = ""; // Force thumbnail refresh
+							resetZoomViewport();
 							tui.requestRender();
 						}
 						return;
@@ -880,24 +1298,106 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 					if (data === "z" || data === "Z") {
 						cleanupImage();
-						lastRenderedPath = "";
 						previewZoom = !previewZoom;
+						resetZoomViewport();
 						tui.requestRender();
 						return;
 					}
 
+					if (previewZoom) {
+						if (data === "+" || data === "=") {
+							if (setZoomLevel(zoomLevel + ZOOM_LEVEL_STEP)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (data === "-" || data === "_") {
+							if (setZoomLevel(zoomLevel - ZOOM_LEVEL_STEP)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (data === "0") {
+							if (zoomLevel !== 1 || panX !== 0 || panY !== 0) {
+								resetZoomViewport();
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (data === "[" || data === "{") {
+							if (moveCursor(-1)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (data === "]" || data === "}") {
+							if (moveCursor(1)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (matchesKey(data, Key.left)) {
+							if (panViewport(-1, 0)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (matchesKey(data, Key.right)) {
+							if (panViewport(1, 0)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (matchesKey(data, Key.up)) {
+							const didPan = panViewport(0, -1);
+							if (didPan) {
+								tui.requestRender();
+								return;
+							}
+
+							if (supportsKittyInspector && zoomLevel > ZOOM_LEVEL_MIN) {
+								return;
+							}
+
+							if (moveCursor(-1)) {
+								tui.requestRender();
+							}
+							return;
+						}
+
+						if (matchesKey(data, Key.down)) {
+							const didPan = panViewport(0, 1);
+							if (didPan) {
+								tui.requestRender();
+								return;
+							}
+
+							if (supportsKittyInspector && zoomLevel > ZOOM_LEVEL_MIN) {
+								return;
+							}
+
+							if (moveCursor(1)) {
+								tui.requestRender();
+							}
+							return;
+						}
+					}
+
 					if (matchesKey(data, Key.up)) {
-						cursor = Math.max(0, cursor - 1);
-						if (cursor < scrollOffset) {
-							scrollOffset = cursor;
+						if (moveCursor(-1)) {
+							tui.requestRender();
 						}
-						tui.requestRender();
 					} else if (matchesKey(data, Key.down)) {
-						cursor = Math.min(screenshots.length - 1, cursor + 1);
-						if (cursor >= scrollOffset + LIST_VISIBLE_ITEMS) {
-							scrollOffset = cursor - LIST_VISIBLE_ITEMS + 1;
+						if (moveCursor(1)) {
+							tui.requestRender();
 						}
-						tui.requestRender();
 					} else if (matchesKey(data, Key.space) || data === "s" || data === "S") {
 						// Toggle stage/unstage current screenshot
 						if (screenshots[cursor]) {
@@ -932,6 +1432,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 
 							// Remove from thumbnails cache
 							thumbnails.delete(screenshot.path);
+							imageDimensionsCache.delete(screenshot.path);
 
 							// Remove from alreadyStaged if it was staged
 							if (alreadyStaged.has(screenshot.path)) {
@@ -959,6 +1460,7 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 									activeTab = nonEmptyTabIndex;
 									cursor = 0;
 									scrollOffset = 0;
+									resetZoomViewport();
 								} else {
 									cleanupImage();
 									done(null); // No more screenshots, close
@@ -971,9 +1473,9 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 								if (scrollOffset > 0 && scrollOffset >= tabScreenshots.length - LIST_VISIBLE_ITEMS + 1) {
 									scrollOffset = Math.max(0, tabScreenshots.length - LIST_VISIBLE_ITEMS);
 								}
+								resetZoomViewport();
 							}
 
-							lastRenderedPath = ""; // Force thumbnail refresh
 							tui.requestRender();
 						} catch {
 							// Silently fail if deletion fails
@@ -981,7 +1483,10 @@ export default function screenshotsExtension(pi: ExtensionAPI) {
 					}
 				},
 			};
-		});
+			});
+		} finally {
+			requestPreviewRender = null;
+		}
 
 		// User cancelled
 		if (result === null) {
